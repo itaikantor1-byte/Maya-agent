@@ -3,7 +3,7 @@ import time
 import imaplib
 import email
 from email.header import decode_header
-from google import genai
+import google.generativeai as genai
 import requests
 from datetime import datetime
 
@@ -14,7 +14,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-1.5-flash")
 
 processed_emails = set()
 
@@ -89,10 +90,7 @@ def analyze_report(subject, body):
 ענה בעברית בלבד, בצורה מסודרת וקריאה.
 """
     try:
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt
-        )
+        response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
         print(f"שגיאה ב-Gemini: {e}")
