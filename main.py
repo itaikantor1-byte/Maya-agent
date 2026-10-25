@@ -3,7 +3,7 @@ import time
 import imaplib
 import email
 from email.header import decode_header
-import google.generativeai as genai
+from google import genai
 import requests
 from datetime import datetime
 
@@ -14,12 +14,14 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 processed_emails = set()
 
 def send_telegram(message: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("חסרים פרטי טלגרם")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -27,7 +29,10 @@ def send_telegram(message: str):
         "parse_mode": "HTML"
     }
     try:
-        requests.post(url, json=payload, timeout=10)
+        r = requests.post(url, json=payload, timeout=15)
+        print(f"Telegram status: {r.status_code}")
+        if r.status_code != 200:
+            print(r.text)
     except Exception as e:
         print(f"שגיאה בשליחה לטלגרם: {e}")
 
@@ -84,13 +89,19 @@ def analyze_report(subject, body):
 ענה בעברית בלבד, בצורה מסודרת וקריאה.
 """
     try:
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt
+        )
         return response.text.strip()
     except Exception as e:
         print(f"שגיאה ב-Gemini: {e}")
         return None
 
 def check_emails():
+    if not GMAIL_USER or not GMAIL_APP_PASSWORD:
+        print("חסרים פרטי Gmail")
+        return
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(GMAIL_USER, GMAIL_APP_PASSWORD)
@@ -98,6 +109,7 @@ def check_emails():
 
         status, messages = mail.search(None, '(OR FROM "mailtase" FROM "maya" SUBJECT "דיווח")')
         if status != "OK":
+            mail.logout()
             return
 
         email_ids = messages[0].split()
@@ -123,17 +135,15 @@ def check_emails():
 
             analysis = analyze_report(subject, body)
 
-            if analysis and "לא מהותי" not in analysis[:30]:
-                message = f"""
-📢 <b>דיווח מהותי חדש ממאייה</b>
+            if analysis and "לא מהותי" not in analysis[:40]:
+                message = f"""📢 <b>דיווח מהותי חדש ממאייה</b>
 
 <b>נושא:</b>
 {subject}
 
 {analysis}
 
-⏰ {datetime.now().strftime("%d/%m/%Y %H:%M")}
-"""
+⏰ {datetime.now().strftime("%d/%m/%Y %H:%M")}"""
                 send_telegram(message)
                 print("נשלח לטלגרם")
             else:
