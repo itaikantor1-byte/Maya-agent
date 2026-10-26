@@ -86,7 +86,7 @@ def extract_pdf_text(pdf_url):
         r.raise_for_status()
         with pdfplumber.open(io.BytesIO(r.content)) as pdf:
             text = ""
-            for page in pdf.pages[:10]:  # עד 10 עמודים
+            for page in pdf.pages[:10]:
                 extracted = page.extract_text()
                 if extracted:
                     text += extracted + "\n"
@@ -102,31 +102,44 @@ def fetch_maya_content(url):
         print(f"בודק דף: {url}", flush=True)
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
         r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
+        html = r.text
+        soup = BeautifulSoup(html, "html.parser")
 
-        # חיפוש קישורי PDF
-        pdf_links = []
+        pdf_url = None
+
         for a in soup.find_all("a", href=True):
             href = a["href"]
-            if ".pdf" in href.lower() or "pdf" in href.lower():
+            if ".pdf" in href.lower():
                 if href.startswith("http"):
-                    pdf_links.append(href)
+                    pdf_url = href
                 elif href.startswith("/"):
-                    pdf_links.append("https://maya.tase.co.il" + href)
-                else:
-                    pdf_links.append(url.rsplit("/", 1)[0] + "/" + href)
+                    pdf_url = "https://maya.tase.co.il" + href
+                break
 
-        # גם חיפוש ב-src או בתוך הטקסט
-        for link in re.findall(r'https?://[^\s"\']+\.pdf', r.text, re.I):
-            pdf_links.append(link)
+        if not pdf_url:
+            matches = re.findall(r'https?://[^"\s]+\.pdf', html, re.I)
+            if matches:
+                pdf_url = matches[0]
 
-        pdf_links = list(dict.fromkeys(pdf_links))  # הסרת כפילויות
+        if not pdf_url and "/reports/details/" in url:
+            report_id = url.split("/")[-1].split("?")[0]
+            possible = [
+                f"https://mayafiles.tase.co.il/rpdf/{report_id[:4]}001-{int(report_id[:4])+1}000/P{report_id}-00.pdf",
+                f"https://maya.tase.co.il/reports/pdf/{report_id}",
+            ]
+            for p in possible:
+                try:
+                    head = requests.head(p, timeout=10)
+                    if head.status_code == 200:
+                        pdf_url = p
+                        break
+                except:
+                    pass
 
-        if pdf_links:
-            print(f"נמצאו {len(pdf_links)} קישורי PDF", flush=True)
-            return extract_pdf_text(pdf_links[0])
+        if pdf_url:
+            print(f"נמצא PDF: {pdf_url}", flush=True)
+            return extract_pdf_text(pdf_url)
 
-        # אם אין PDF, ננסה טקסט רגיל
         text = soup.get_text(separator="\n", strip=True)
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         result = "\n".join(lines)[:8000]
@@ -139,7 +152,7 @@ def fetch_maya_content(url):
 def analyze_report(subject, body):
     prompt = f"""אתה אנליסט שוק הון ישראלי מקצועי.
 נושא: {subject}
-תוכן הדיווח (מ-PDF או מהדף):
+תוכן הדיווח:
 {body}
 
 אם הדיווח מהותי – תן סיכום, למה מהותי והשפעה אפשרית.
