@@ -11,7 +11,6 @@ import re
 
 print("=== התחלת סוכן מאיה ===", flush=True)
 
-# --- הגדרות ---
 GMAIL_USER = os.getenv("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -36,8 +35,6 @@ def send_telegram(message: str):
     try:
         r = requests.post(url, json=payload, timeout=15)
         print(f"Telegram status: {r.status_code}", flush=True)
-        if r.status_code != 200:
-            print(r.text, flush=True)
     except Exception as e:
         print(f"שגיאה בשליחה לטלגרם: {e}", flush=True)
 
@@ -78,23 +75,16 @@ def extract_maya_link(body):
     links = re.findall(r'https?://[^\s<>"\']+', body)
     for link in links:
         if "maya.tase.co.il" in link or "tase.co.il" in link:
-            link = link.rstrip(").,;]")
-            return link
+            return link.rstrip(").,;]")
     return None
 
 def fetch_maya_report(url):
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
+        headers = {"User-Agent": "Mozilla/5.0"}
         response = requests.get(url, headers=headers, timeout=20)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
-
-        content = soup.find("div", class_=re.compile("report|content|body|text", re.I))
-        if not content:
-            content = soup.find("article") or soup.find("main") or soup.find("body")
-
+        content = soup.find("body")
         if content:
             text = content.get_text(separator="\n", strip=True)
             lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -123,9 +113,9 @@ def analyze_report(subject, body):
    - למה הוא מהותי
    - איך זה עשוי להשפיע על החברה (חיובי / שלילי / נייטרלי + הסבר)
 
-אם הדיווח לא מהותי (למשל דיווח טכני קטן, מימוש אופציות קטן, שינוי מרשם רגיל וכו') – ענה רק במילה: לא מהותי
+אם הדיווח לא מהותי – ענה רק במילה: לא מהותי
 
-ענה בעברית בלבד, בצורה מסודרת וקריאה.
+ענה בעברית בלבד.
 """
     try:
         response = model.generate_content(prompt)
@@ -138,20 +128,23 @@ def check_emails():
     if not GMAIL_USER or not GMAIL_APP_PASSWORD:
         print("חסרים פרטי Gmail", flush=True)
         return
+
+    mail = None
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(GMAIL_USER, GMAIL_APP_PASSWORD)
         mail.select("inbox")
 
-        status, messages = mail.search(None, '(OR FROM "mailtase" FROM "maya" SUBJECT "דיווח")')
+        # חיפוש פשוט יותר
+        status, messages = mail.search(None, 'FROM "mailtase"')
         if status != "OK":
-            mail.logout()
+            print("חיפוש IMAP נכשל", flush=True)
             return
 
         email_ids = messages[0].split()
-        print(f"נמצאו {len(email_ids)} מיילים רלוונטיים", flush=True)
+        print(f"נמצאו {len(email_ids)} מיילים מ-mailtase", flush=True)
 
-        for e_id in email_ids[-15:]:
+        for e_id in email_ids[-20:]:
             e_id_str = e_id.decode()
             if e_id_str in processed_emails:
                 continue
@@ -164,29 +157,24 @@ def check_emails():
             subject = decode_mime_words(msg.get("Subject", ""))
             from_ = decode_mime_words(msg.get("From", ""))
 
-            if "mailtase" not in from_.lower() and "מאיה" not in from_ and "maya" not in from_.lower():
-                processed_emails.add(e_id_str)
-                continue
-
             body = get_email_body(msg)
-            print(f"בודק דיווח: {subject}", flush=True)
+            print(f"בודק: {subject}", flush=True)
 
             maya_link = extract_maya_link(body)
             full_content = body
             if maya_link:
-                print(f"נמצא קישור למאיה: {maya_link}", flush=True)
+                print(f"קישור: {maya_link}", flush=True)
                 fetched = fetch_maya_report(maya_link)
-                if fetched and len(fetched) > len(body):
+                if fetched and len(fetched) > 200:
                     full_content = fetched
-                    print("נמשך תוכן מלא ממאיה", flush=True)
+                    print("נמשך תוכן מלא", flush=True)
 
             analysis = analyze_report(subject, full_content)
 
-            if analysis and "לא מהותי" not in analysis[:40]:
-                message = f"""📢 <b>דיווח מהותי חדש ממאייה</b>
+            if analysis and "לא מהותי" not in analysis[:30]:
+                message = f"""📢 <b>דיווח מהותי</b>
 
-<b>נושא:</b>
-{subject}
+<b>נושא:</b> {subject}
 
 {analysis}
 
@@ -194,16 +182,21 @@ def check_emails():
                 send_telegram(message)
                 print("נשלח לטלגרם", flush=True)
             else:
-                print("לא מהותי - לא נשלח", flush=True)
+                print("לא מהותי", flush=True)
 
             processed_emails.add(e_id_str)
 
-        mail.logout()
     except Exception as e:
-        print(f"שגיאה כללית: {e}", flush=True)
+        print(f"שגיאה: {e}", flush=True)
+    finally:
+        if mail:
+            try:
+                mail.logout()
+            except:
+                pass
 
-print("הסוכן של מאיה התחיל לרוץ...", flush=True)
-send_telegram("✅ הסוכן של מאיה עלה בהצלחה ומתחיל לנטר דיווחים (כולל משיכת תוכן מלא)")
+print("הסוכן התחיל", flush=True)
+send_telegram("✅ הסוכן עלה ומתחיל לנטר")
 
 while True:
     check_emails()
