@@ -9,6 +9,8 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 import re
 
+print("=== התחלת סוכן מאיה ===", flush=True)
+
 # --- הגדרות ---
 GMAIL_USER = os.getenv("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
@@ -23,7 +25,7 @@ processed_emails = set()
 
 def send_telegram(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("חסרים פרטי טלגרם")
+        print("חסרים פרטי טלגרם", flush=True)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -33,11 +35,11 @@ def send_telegram(message: str):
     }
     try:
         r = requests.post(url, json=payload, timeout=15)
-        print(f"Telegram status: {r.status_code}")
+        print(f"Telegram status: {r.status_code}", flush=True)
         if r.status_code != 200:
-            print(r.text)
+            print(r.text, flush=True)
     except Exception as e:
-        print(f"שגיאה בשליחה לטלגרם: {e}")
+        print(f"שגיאה בשליחה לטלגרם: {e}", flush=True)
 
 def decode_mime_words(s):
     if s is None:
@@ -73,11 +75,9 @@ def get_email_body(msg):
     return body
 
 def extract_maya_link(body):
-    # חיפוש קישורי מאיה
     links = re.findall(r'https?://[^\s<>"\']+', body)
     for link in links:
         if "maya.tase.co.il" in link or "tase.co.il" in link:
-            # ניקוי סוגריים או תווים מיותרים בסוף
             link = link.rstrip(").,;]")
             return link
     return None
@@ -91,20 +91,17 @@ def fetch_maya_report(url):
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
 
-        # ניסיון למשוך את התוכן העיקרי של הדיווח
-        # אזורים נפוצים במאיה
         content = soup.find("div", class_=re.compile("report|content|body|text", re.I))
         if not content:
             content = soup.find("article") or soup.find("main") or soup.find("body")
 
         if content:
             text = content.get_text(separator="\n", strip=True)
-            # ניקוי שורות ריקות מיותרות
             lines = [line.strip() for line in text.splitlines() if line.strip()]
             return "\n".join(lines)[:10000]
         return soup.get_text(separator="\n", strip=True)[:10000]
     except Exception as e:
-        print(f"שגיאה במשיכת דיווח ממאיה: {e}")
+        print(f"שגיאה במשיכת דיווח ממאיה: {e}", flush=True)
         return None
 
 def analyze_report(subject, body):
@@ -134,12 +131,12 @@ def analyze_report(subject, body):
         response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
-        print(f"שגיאה ב-Gemini: {e}")
+        print(f"שגיאה ב-Gemini: {e}", flush=True)
         return None
 
 def check_emails():
     if not GMAIL_USER or not GMAIL_APP_PASSWORD:
-        print("חסרים פרטי Gmail")
+        print("חסרים פרטי Gmail", flush=True)
         return
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
@@ -152,6 +149,8 @@ def check_emails():
             return
 
         email_ids = messages[0].split()
+        print(f"נמצאו {len(email_ids)} מיילים רלוונטיים", flush=True)
+
         for e_id in email_ids[-15:]:
             e_id_str = e_id.decode()
             if e_id_str in processed_emails:
@@ -170,17 +169,16 @@ def check_emails():
                 continue
 
             body = get_email_body(msg)
-            print(f"בודק דיווח: {subject}")
+            print(f"בודק דיווח: {subject}", flush=True)
 
-            # ניסיון למשוך את הדיווח המלא ממאיה
             maya_link = extract_maya_link(body)
             full_content = body
             if maya_link:
-                print(f"נמצא קישור למאיה: {maya_link}")
+                print(f"נמצא קישור למאיה: {maya_link}", flush=True)
                 fetched = fetch_maya_report(maya_link)
                 if fetched and len(fetched) > len(body):
                     full_content = fetched
-                    print("נמשך תוכן מלא ממאיה")
+                    print("נמשך תוכן מלא ממאיה", flush=True)
 
             analysis = analyze_report(subject, full_content)
 
@@ -194,17 +192,17 @@ def check_emails():
 
 ⏰ {datetime.now().strftime("%d/%m/%Y %H:%M")}"""
                 send_telegram(message)
-                print("נשלח לטלגרם")
+                print("נשלח לטלגרם", flush=True)
             else:
-                print("לא מהותי - לא נשלח")
+                print("לא מהותי - לא נשלח", flush=True)
 
             processed_emails.add(e_id_str)
 
         mail.logout()
     except Exception as e:
-        print(f"שגיאה כללית: {e}")
+        print(f"שגיאה כללית: {e}", flush=True)
 
-print("הסוכן של מאיה התחיל לרוץ...")
+print("הסוכן של מאיה התחיל לרוץ...", flush=True)
 send_telegram("✅ הסוכן של מאיה עלה בהצלחה ומתחיל לנטר דיווחים (כולל משיכת תוכן מלא)")
 
 while True:
