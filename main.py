@@ -86,82 +86,93 @@ def extract_pdf_text(pdf_url):
         r.raise_for_status()
         with pdfplumber.open(io.BytesIO(r.content)) as pdf:
             text = ""
-            for page in pdf.pages[:10]:
+            for page in pdf.pages[:12]:
                 extracted = page.extract_text()
                 if extracted:
                     text += extracted + "\n"
-            result = text.strip()[:12000]
+            result = text.strip()[:15000]
             print(f"אורך טקסט מ-PDF: {len(result)}", flush=True)
             return result
     except Exception as e:
         print(f"שגיאה בחילוץ PDF: {e}", flush=True)
         return None
 
+def get_pdf_url_from_report_id(report_id: str) -> str:
+    try:
+        rid = int(report_id)
+        start = (rid // 1000) * 1000 + 1
+        end = start + 999
+        folder = f"{start}-{end}"
+        return f"https://mayafiles.tase.co.il/rpdf/{folder}/P{report_id}-00.pdf"
+    except:
+        return None
+
 def fetch_maya_content(url):
     try:
         print(f"בודק דף: {url}", flush=True)
+
+        report_id = None
+        if "/reports/" in url:
+            parts = url.replace("?", "/").split("/")
+            for p in parts:
+                clean = p.split("?")[0]
+                if clean.isdigit() and len(clean) >= 6:
+                    report_id = clean
+                    break
+
+        if report_id:
+            pdf_url = get_pdf_url_from_report_id(report_id)
+            if pdf_url:
+                print(f"מנסה PDF ישיר: {pdf_url}", flush=True)
+                try:
+                    head = requests.head(pdf_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+                    if head.status_code == 200:
+                        print("PDF נמצא!", flush=True)
+                        return extract_pdf_text(pdf_url)
+                    else:
+                        print(f"PDF לא נמצא (status {head.status_code})", flush=True)
+                except Exception as e:
+                    print(f"בדיקת PDF נכשלה: {e}", flush=True)
+
+        # fallback
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
         r.raise_for_status()
-        html = r.text
-        soup = BeautifulSoup(html, "html.parser")
-
-        pdf_url = None
+        soup = BeautifulSoup(r.text, "html.parser")
 
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if ".pdf" in href.lower():
-                if href.startswith("http"):
-                    pdf_url = href
-                elif href.startswith("/"):
-                    pdf_url = "https://maya.tase.co.il" + href
-                break
-
-        if not pdf_url:
-            matches = re.findall(r'https?://[^"\s]+\.pdf', html, re.I)
-            if matches:
-                pdf_url = matches[0]
-
-        if not pdf_url and "/reports/details/" in url:
-            report_id = url.split("/")[-1].split("?")[0]
-            possible = [
-                f"https://mayafiles.tase.co.il/rpdf/{report_id[:4]}001-{int(report_id[:4])+1}000/P{report_id}-00.pdf",
-                f"https://maya.tase.co.il/reports/pdf/{report_id}",
-            ]
-            for p in possible:
-                try:
-                    head = requests.head(p, timeout=10)
-                    if head.status_code == 200:
-                        pdf_url = p
-                        break
-                except:
-                    pass
-
-        if pdf_url:
-            print(f"נמצא PDF: {pdf_url}", flush=True)
-            return extract_pdf_text(pdf_url)
+                full = href if href.startswith("http") else "https://maya.tase.co.il" + href
+                return extract_pdf_text(full)
 
         text = soup.get_text(separator="\n", strip=True)
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         result = "\n".join(lines)[:8000]
         print(f"אין PDF, אורך טקסט: {len(result)}", flush=True)
         return result
+
     except Exception as e:
         print(f"שגיאה בדף מאיה: {e}", flush=True)
         return None
 
 def analyze_report(subject, body):
     prompt = f"""אתה אנליסט שוק הון ישראלי מקצועי.
-נושא: {subject}
-תוכן הדיווח:
+נושא הדיווח: {subject}
+תוכן הדיווח (מ-PDF):
 {body}
 
-אם הדיווח מהותי – תן סיכום, למה מהותי והשפעה אפשרית.
+אם הדיווח מהותי לחברה – תן:
+- סיכום קצר וברור
+- למה הוא מהותי
+- השפעה אפשרית (חיובי/שלילי/נייטרלי + הסבר)
+
 אם לא מהותי – ענה רק: לא מהותי
-ענה בעברית."""
+
+ענה בעברית בלבד, בצורה מסודרת."""
     try:
         response = model.generate_content(prompt)
         result = response.text.strip()
-        print(f"Gemini: {result[:400]}", flush=True)
+        print(f"Gemini: {result[:500]}", flush=True)
         return result
     except Exception as e:
         print(f"שגיאת Gemini: {e}", flush=True)
@@ -184,7 +195,7 @@ def check_emails():
         email_ids = data[0].split()
         print(f"סה\"כ מיילים: {len(email_ids)}", flush=True)
 
-        for e_id in email_ids[-20:]:
+        for e_id in email_ids[-25:]:
             e_id_str = e_id.decode()
             if e_id_str in processed_emails:
                 continue
@@ -208,25 +219,27 @@ def check_emails():
             content = body
             if link:
                 fetched = fetch_maya_content(link)
-                if fetched and len(fetched) > 400:
+                if fetched and len(fetched) > 500:
                     content = fetched
+                    print("משתמש בתוכן מ-PDF", flush=True)
 
             analysis = analyze_report(subject, content)
 
             if analysis and "לא מהותי" not in analysis[:30]:
-                send_telegram(f"📢 <b>{subject}</b>\n\n{analysis}\n\n⏰ {datetime.now().strftime('%d/%m %H:%M')}")
-                print(">>> נשלח", flush=True)
+                msg_text = f"📢 <b>{subject}</b>\n\n{analysis}\n\n⏰ {datetime.now().strftime('%d/%m %H:%M')}"
+                send_telegram(msg_text)
+                print(">>> נשלח לטלגרם", flush=True)
             else:
-                print(">>> לא מהותי", flush=True)
+                print(">>> לא מהותי - לא נשלח", flush=True)
 
             processed_emails.add(e_id_str)
 
         mail.logout()
     except Exception as e:
-        print(f"שגיאה: {e}", flush=True)
+        print(f"שגיאה כללית: {e}", flush=True)
 
 print("הסוכן התחיל", flush=True)
-send_telegram("✅ הסוכן עלה (גרסת PDF)")
+send_telegram("✅ הסוכן עלה (גרסת PDF ישיר)")
 
 while True:
     check_emails()
