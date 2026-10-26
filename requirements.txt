@@ -1,3 +1,4 @@
 google-generativeai
 requests
 beautifulsoup4
+pdfplumber
