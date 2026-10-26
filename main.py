@@ -11,11 +11,14 @@ import re
 
 print("=== התחלת סוכן מאיה ===", flush=True)
 
-GMAIL_USER = os.getenv("GMAIL_USER")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+GMAIL_USER = os.getenv("GMAIL_USER", "").strip()
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "").replace(" ", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+print(f"Gmail user: {GMAIL_USER}", flush=True)
+print(f"Password length: {len(GMAIL_APP_PASSWORD)}", flush=True)
 
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-1.5-flash")
@@ -24,22 +27,15 @@ processed_emails = set()
 
 def send_telegram(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("חסרים פרטי טלגרם", flush=True)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"
-    }
     try:
-        r = requests.post(url, json=payload, timeout=15)
-        print(f"Telegram status: {r.status_code}", flush=True)
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=15)
     except Exception as e:
-        print(f"שגיאה בשליחה לטלגרם: {e}", flush=True)
+        print(f"Telegram error: {e}", flush=True)
 
 def decode_mime_words(s):
-    if s is None:
+    if not s:
         return ""
     decoded = decode_header(s)
     result = ""
@@ -54,74 +50,53 @@ def get_email_body(msg):
     body = ""
     if msg.is_multipart():
         for part in msg.walk():
-            content_type = part.get_content_type()
-            if content_type in ("text/plain", "text/html"):
+            if part.get_content_type() in ("text/plain", "text/html"):
                 try:
                     payload = part.get_payload(decode=True)
                     if payload:
                         body += payload.decode(errors="ignore")
-                except Exception:
+                except:
                     pass
     else:
         try:
             payload = msg.get_payload(decode=True)
             if payload:
                 body = payload.decode(errors="ignore")
-        except Exception:
-            body = str(msg.get_payload())
+        except:
+            pass
     return body
 
 def extract_maya_link(body):
-    links = re.findall(r'https?://[^\s<>"\']+', body)
-    for link in links:
+    for link in re.findall(r'https?://[^\s<>"\']+', body):
         if "maya.tase.co.il" in link or "tase.co.il" in link:
             return link.rstrip(").,;]")
     return None
 
 def fetch_maya_report(url):
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=20)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        content = soup.find("body")
-        if content:
-            text = content.get_text(separator="\n", strip=True)
-            lines = [line.strip() for line in text.splitlines() if line.strip()]
-            return "\n".join(lines)[:10000]
-        return soup.get_text(separator="\n", strip=True)[:10000]
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        text = soup.get_text(separator="\n", strip=True)
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        return "\n".join(lines)[:10000]
     except Exception as e:
-        print(f"שגיאה במשיכת דיווח ממאיה: {e}", flush=True)
+        print(f"Fetch error: {e}", flush=True)
         return None
 
 def analyze_report(subject, body):
-    prompt = f"""
-אתה אנליסט שוק הון ישראלי מקצועי.
+    prompt = f"""אתה אנליסט שוק הון ישראלי.
+נושא: {subject}
+תוכן: {body}
 
-קיבלת דיווח חדש ממערכת מאיה:
-
-נושא הדיווח:
-{subject}
-
-תוכן הדיווח:
-{body}
-
-תפקידך:
-1. להחליט אם הדיווח **מהותי** לחברה שדיווחה.
-2. אם הוא מהותי – תן:
-   - סיכום קצר וברור של הדיווח
-   - למה הוא מהותי
-   - איך זה עשוי להשפיע על החברה (חיובי / שלילי / נייטרלי + הסבר)
-
-אם הדיווח לא מהותי – ענה רק במילה: לא מהותי
-
-ענה בעברית בלבד.
-"""
+אם הדיווח מהותי – תן סיכום, למה מהותי והשפעה אפשרית.
+אם לא מהותי – ענה רק: לא מהותי
+ענה בעברית."""
     try:
         response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
-        print(f"שגיאה ב-Gemini: {e}", flush=True)
+        print(f"Gemini error: {e}", flush=True)
         return None
 
 def check_emails():
@@ -129,22 +104,22 @@ def check_emails():
         print("חסרים פרטי Gmail", flush=True)
         return
 
-    mail = None
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-        mail.select("inbox")
+        mail.select("INBOX")
 
-        # חיפוש פשוט יותר
-        status, messages = mail.search(None, 'FROM "mailtase"')
+        status, data = mail.search(None, "ALL")
         if status != "OK":
-            print("חיפוש IMAP נכשל", flush=True)
+            print("Search failed", flush=True)
+            mail.logout()
             return
 
-        email_ids = messages[0].split()
-        print(f"נמצאו {len(email_ids)} מיילים מ-mailtase", flush=True)
+        email_ids = data[0].split()
+        print(f"Total emails in inbox: {len(email_ids)}", flush=True)
 
-        for e_id in email_ids[-20:]:
+        # רק 30 האחרונים
+        for e_id in email_ids[-30:]:
             e_id_str = e_id.decode()
             if e_id_str in processed_emails:
                 continue
@@ -155,48 +130,37 @@ def check_emails():
 
             msg = email.message_from_bytes(msg_data[0][1])
             subject = decode_mime_words(msg.get("Subject", ""))
-            from_ = decode_mime_words(msg.get("From", ""))
+            from_ = decode_mime_words(msg.get("From", "")).lower()
+
+            if "mailtase" not in from_ and "maya" not in from_ and "מאיה" not in from_:
+                processed_emails.add(e_id_str)
+                continue
 
             body = get_email_body(msg)
             print(f"בודק: {subject}", flush=True)
 
-            maya_link = extract_maya_link(body)
-            full_content = body
-            if maya_link:
-                print(f"קישור: {maya_link}", flush=True)
-                fetched = fetch_maya_report(maya_link)
-                if fetched and len(fetched) > 200:
-                    full_content = fetched
-                    print("נמשך תוכן מלא", flush=True)
+            link = extract_maya_link(body)
+            content = body
+            if link:
+                fetched = fetch_maya_report(link)
+                if fetched and len(fetched) > 300:
+                    content = fetched
 
-            analysis = analyze_report(subject, full_content)
-
-            if analysis and "לא מהותי" not in analysis[:30]:
-                message = f"""📢 <b>דיווח מהותי</b>
-
-<b>נושא:</b> {subject}
-
-{analysis}
-
-⏰ {datetime.now().strftime("%d/%m/%Y %H:%M")}"""
-                send_telegram(message)
-                print("נשלח לטלגרם", flush=True)
+            analysis = analyze_report(subject, content)
+            if analysis and "לא מהותי" not in analysis[:25]:
+                send_telegram(f"📢 <b>{subject}</b>\n\n{analysis}\n\n⏰ {datetime.now().strftime('%d/%m %H:%M')}")
+                print("נשלח", flush=True)
             else:
                 print("לא מהותי", flush=True)
 
             processed_emails.add(e_id_str)
 
+        mail.logout()
     except Exception as e:
-        print(f"שגיאה: {e}", flush=True)
-    finally:
-        if mail:
-            try:
-                mail.logout()
-            except:
-                pass
+        print(f"IMAP Error: {e}", flush=True)
 
 print("הסוכן התחיל", flush=True)
-send_telegram("✅ הסוכן עלה ומתחיל לנטר")
+send_telegram("✅ הסוכן עלה")
 
 while True:
     check_emails()
