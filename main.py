@@ -86,12 +86,12 @@ def extract_pdf_text(pdf_url):
         r.raise_for_status()
         with pdfplumber.open(io.BytesIO(r.content)) as pdf:
             text_parts = []
-            for i, page in enumerate(pdf.pages[:20]):  # עד 20 עמודים
+            max_pages = min(20, len(pdf.pages))
+            for page in pdf.pages[:max_pages]:
                 extracted = page.extract_text()
                 if extracted:
                     text_parts.append(extracted)
             full_text = "\n".join(text_parts)
-            # ניקוי בסיסי
             full_text = re.sub(r'\s+', ' ', full_text)
             result = full_text.strip()[:18000]
             print(f"אורך טקסט מ-PDF: {len(result)} (מ-{len(pdf.pages)} עמודים)", flush=True)
@@ -100,19 +100,26 @@ def extract_pdf_text(pdf_url):
         print(f"שגיאה בחילוץ PDF: {e}", flush=True)
         return None
 
-def get_pdf_url_from_report_id(report_id: str) -> str:
+def get_possible_pdf_urls(report_id: str):
     try:
         rid = int(report_id)
         start = (rid // 1000) * 1000 + 1
         end = start + 999
         folder = f"{start}-{end}"
-        return f"https://mayafiles.tase.co.il/rpdf/{folder}/P{report_id}-00.pdf"
+        base = f"https://mayafiles.tase.co.il/rpdf/{folder}"
+        return [
+            f"{base}/P{report_id}-00.pdf",
+            f"{base}/P{report_id}.pdf",
+            f"{base}/{report_id}.pdf",
+            f"https://mayafiles.tase.co.il/rpdf/P{report_id}-00.pdf",
+        ]
     except:
-        return None
+        return []
 
 def fetch_maya_content(url):
     try:
         print(f"בודק דף: {url}", flush=True)
+
         report_id = None
         if "/reports/" in url:
             parts = url.replace("?", "/").split("/")
@@ -123,18 +130,17 @@ def fetch_maya_content(url):
                     break
 
         if report_id:
-            pdf_url = get_pdf_url_from_report_id(report_id)
-            if pdf_url:
-                print(f"מנסה PDF ישיר: {pdf_url}", flush=True)
+            possible_urls = get_possible_pdf_urls(report_id)
+            for pdf_url in possible_urls:
+                print(f"מנסה: {pdf_url}", flush=True)
                 try:
-                    head = requests.head(pdf_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+                    head = requests.head(pdf_url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
                     if head.status_code == 200:
                         print("PDF נמצא!", flush=True)
                         return extract_pdf_text(pdf_url)
-                    else:
-                        print(f"PDF לא נמצא (status {head.status_code})", flush=True)
-                except Exception as e:
-                    print(f"בדיקת PDF נכשלה: {e}", flush=True)
+                except:
+                    continue
+            print("אף PDF לא נמצא בכתובות הישירות", flush=True)
 
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
         r.raise_for_status()
@@ -150,6 +156,7 @@ def fetch_maya_content(url):
         result = "\n".join(lines)[:8000]
         print(f"אין PDF, אורך טקסט: {len(result)}", flush=True)
         return result
+
     except Exception as e:
         print(f"שגיאה בדף מאיה: {e}", flush=True)
         return None
@@ -200,7 +207,8 @@ def check_emails():
         email_ids = data[0].split()
         print(f"סה\"כ מיילים: {len(email_ids)}", flush=True)
 
-        for e_id in email_ids[-30:]:
+        processed_count = 0
+        for e_id in email_ids[-40:]:  # בודק את 40 האחרונים
             e_id_str = e_id.decode()
             if e_id_str in processed_emails:
                 continue
@@ -218,7 +226,8 @@ def check_emails():
                 continue
 
             body = get_email_body(msg)
-            print(f"\n=== בודק: {subject} ===", flush=True)
+            print(f"\n=== בודק ({processed_count+1}): {subject} ===", flush=True)
+            processed_count += 1
 
             link = extract_maya_link(body)
             content = body
@@ -239,12 +248,13 @@ def check_emails():
 
             processed_emails.add(e_id_str)
 
+        print(f"סיים בדיקה של {processed_count} דיווחים ממאייה", flush=True)
         mail.logout()
     except Exception as e:
         print(f"שגיאה כללית: {e}", flush=True)
 
 print("הסוכן התחיל", flush=True)
-send_telegram("✅ הסוכן עלה (גרסה משופרת ל-PDF)")
+send_telegram("✅ הסוכן עלה (גרסה משופרת)")
 
 while True:
     check_emails()
