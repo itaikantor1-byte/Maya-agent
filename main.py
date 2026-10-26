@@ -6,6 +6,8 @@ from email.header import decode_header
 import google.generativeai as genai
 import requests
 from datetime import datetime
+from bs4 import BeautifulSoup
+import re
 
 # --- הגדרות ---
 GMAIL_USER = os.getenv("GMAIL_USER")
@@ -56,15 +58,54 @@ def get_email_body(msg):
             content_type = part.get_content_type()
             if content_type in ("text/plain", "text/html"):
                 try:
-                    body += part.get_payload(decode=True).decode(errors="ignore")
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        body += payload.decode(errors="ignore")
                 except Exception:
                     pass
     else:
         try:
-            body = msg.get_payload(decode=True).decode(errors="ignore")
+            payload = msg.get_payload(decode=True)
+            if payload:
+                body = payload.decode(errors="ignore")
         except Exception:
             body = str(msg.get_payload())
-    return body[:8000]
+    return body
+
+def extract_maya_link(body):
+    # חיפוש קישורי מאיה
+    links = re.findall(r'https?://[^\s<>"\']+', body)
+    for link in links:
+        if "maya.tase.co.il" in link or "tase.co.il" in link:
+            # ניקוי סוגריים או תווים מיותרים בסוף
+            link = link.rstrip(").,;]")
+            return link
+    return None
+
+def fetch_maya_report(url):
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        response = requests.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # ניסיון למשוך את התוכן העיקרי של הדיווח
+        # אזורים נפוצים במאיה
+        content = soup.find("div", class_=re.compile("report|content|body|text", re.I))
+        if not content:
+            content = soup.find("article") or soup.find("main") or soup.find("body")
+
+        if content:
+            text = content.get_text(separator="\n", strip=True)
+            # ניקוי שורות ריקות מיותרות
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            return "\n".join(lines)[:10000]
+        return soup.get_text(separator="\n", strip=True)[:10000]
+    except Exception as e:
+        print(f"שגיאה במשיכת דיווח ממאיה: {e}")
+        return None
 
 def analyze_report(subject, body):
     prompt = f"""
@@ -131,7 +172,17 @@ def check_emails():
             body = get_email_body(msg)
             print(f"בודק דיווח: {subject}")
 
-            analysis = analyze_report(subject, body)
+            # ניסיון למשוך את הדיווח המלא ממאיה
+            maya_link = extract_maya_link(body)
+            full_content = body
+            if maya_link:
+                print(f"נמצא קישור למאיה: {maya_link}")
+                fetched = fetch_maya_report(maya_link)
+                if fetched and len(fetched) > len(body):
+                    full_content = fetched
+                    print("נמשך תוכן מלא ממאיה")
+
+            analysis = analyze_report(subject, full_content)
 
             if analysis and "לא מהותי" not in analysis[:40]:
                 message = f"""📢 <b>דיווח מהותי חדש ממאייה</b>
@@ -154,7 +205,7 @@ def check_emails():
         print(f"שגיאה כללית: {e}")
 
 print("הסוכן של מאיה התחיל לרוץ...")
-send_telegram("✅ הסוכן של מאיה עלה בהצלחה ומתחיל לנטר דיווחים")
+send_telegram("✅ הסוכן של מאיה עלה בהצלחה ומתחיל לנטר דיווחים (כולל משיכת תוכן מלא)")
 
 while True:
     check_emails()
