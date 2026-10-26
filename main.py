@@ -85,13 +85,16 @@ def extract_pdf_text(pdf_url):
         r = requests.get(pdf_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
         r.raise_for_status()
         with pdfplumber.open(io.BytesIO(r.content)) as pdf:
-            text = ""
-            for page in pdf.pages[:12]:
+            text_parts = []
+            for i, page in enumerate(pdf.pages[:20]):  # עד 20 עמודים
                 extracted = page.extract_text()
                 if extracted:
-                    text += extracted + "\n"
-            result = text.strip()[:15000]
-            print(f"אורך טקסט מ-PDF: {len(result)}", flush=True)
+                    text_parts.append(extracted)
+            full_text = "\n".join(text_parts)
+            # ניקוי בסיסי
+            full_text = re.sub(r'\s+', ' ', full_text)
+            result = full_text.strip()[:18000]
+            print(f"אורך טקסט מ-PDF: {len(result)} (מ-{len(pdf.pages)} עמודים)", flush=True)
             return result
     except Exception as e:
         print(f"שגיאה בחילוץ PDF: {e}", flush=True)
@@ -110,7 +113,6 @@ def get_pdf_url_from_report_id(report_id: str) -> str:
 def fetch_maya_content(url):
     try:
         print(f"בודק דף: {url}", flush=True)
-
         report_id = None
         if "/reports/" in url:
             parts = url.replace("?", "/").split("/")
@@ -134,11 +136,9 @@ def fetch_maya_content(url):
                 except Exception as e:
                     print(f"בדיקת PDF נכשלה: {e}", flush=True)
 
-        # fallback
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if ".pdf" in href.lower():
@@ -150,29 +150,34 @@ def fetch_maya_content(url):
         result = "\n".join(lines)[:8000]
         print(f"אין PDF, אורך טקסט: {len(result)}", flush=True)
         return result
-
     except Exception as e:
         print(f"שגיאה בדף מאיה: {e}", flush=True)
         return None
 
 def analyze_report(subject, body):
-    prompt = f"""אתה אנליסט שוק הון ישראלי מקצועי.
+    prompt = f"""אתה אנליסט שוק הון ישראלי מנוסה.
+
 נושא הדיווח: {subject}
-תוכן הדיווח (מ-PDF):
+
+תוכן הדיווח:
 {body}
 
-אם הדיווח מהותי לחברה – תן:
-- סיכום קצר וברור
-- למה הוא מהותי
-- השפעה אפשרית (חיובי/שלילי/נייטרלי + הסבר)
+הנחיות חשובות:
+- עסקאות רכישה/מיזוג, הצעות רכש, שינויי שליטה, עסקאות גדולות (מעל עשרות מיליוני ש"ח), או עדכונים מהותיים על נכסים/פרויקטים – נחשבים **מהותיים**.
+- דיווחים טכניים קטנים (מימוש אופציות קטן, שינוי מרשם רגיל, הודעות שגרתיות) – לא מהותיים.
+
+אם הדיווח מהותי:
+1. סיכום קצר וברור של העיקר
+2. למה הוא מהותי
+3. השפעה אפשרית על החברה (חיובי/שלילי/נייטרלי + הסבר קצר)
 
 אם לא מהותי – ענה רק: לא מהותי
 
-ענה בעברית בלבד, בצורה מסודרת."""
+ענה בעברית, בצורה מסודרת וקריאה."""
     try:
         response = model.generate_content(prompt)
         result = response.text.strip()
-        print(f"Gemini: {result[:500]}", flush=True)
+        print(f"Gemini תשובה: {result[:600]}", flush=True)
         return result
     except Exception as e:
         print(f"שגיאת Gemini: {e}", flush=True)
@@ -195,7 +200,7 @@ def check_emails():
         email_ids = data[0].split()
         print(f"סה\"כ מיילים: {len(email_ids)}", flush=True)
 
-        for e_id in email_ids[-25:]:
+        for e_id in email_ids[-30:]:
             e_id_str = e_id.decode()
             if e_id_str in processed_emails:
                 continue
@@ -219,13 +224,13 @@ def check_emails():
             content = body
             if link:
                 fetched = fetch_maya_content(link)
-                if fetched and len(fetched) > 500:
+                if fetched and len(fetched) > 300:
                     content = fetched
                     print("משתמש בתוכן מ-PDF", flush=True)
 
             analysis = analyze_report(subject, content)
 
-            if analysis and "לא מהותי" not in analysis[:30]:
+            if analysis and "לא מהותי" not in analysis[:40]:
                 msg_text = f"📢 <b>{subject}</b>\n\n{analysis}\n\n⏰ {datetime.now().strftime('%d/%m %H:%M')}"
                 send_telegram(msg_text)
                 print(">>> נשלח לטלגרם", flush=True)
@@ -239,7 +244,7 @@ def check_emails():
         print(f"שגיאה כללית: {e}", flush=True)
 
 print("הסוכן התחיל", flush=True)
-send_telegram("✅ הסוכן עלה (גרסת PDF ישיר)")
+send_telegram("✅ הסוכן עלה (גרסה משופרת ל-PDF)")
 
 while True:
     check_emails()
