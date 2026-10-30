@@ -1,4 +1,5 @@
 import email
+import os
 from email import policy
 import tempfile
 import unittest
@@ -6,6 +7,22 @@ from unittest.mock import patch, Mock
 import main
 
 class MonitorTests(unittest.TestCase):
+    def test_analysis_timeout_configurable_without_dropping_documents(self):
+        parts = [{"text": "original report"}, {"inlineData": {"mimeType": "application/pdf", "data": "example"}}]
+        with patch.dict(os.environ, {"GEMINI_READ_TIMEOUT_SECONDS": "600"}):
+            with patch.object(main.requests, 'post', return_value=Mock(status_code=503)) as send:
+                with self.assertRaises(main.Retryable):
+                    main.analyze(parts, {}, 'test-model', 'AQ.fake-key')
+                self.assertEqual(send.call_args.kwargs['timeout'], (10, 600))
+                self.assertEqual(send.call_args.kwargs['json']['contents'][0]['parts'][1:], parts)
+
+    def test_invalid_timeout_rejected_before_request(self):
+        with patch.dict(os.environ, {"GEMINI_READ_TIMEOUT_SECONDS": "0"}):
+            with patch.object(main.requests, 'post') as send:
+                with self.assertRaises(ValueError):
+                    main.analyze([], {}, 'test-model', 'AQ.fake-key')
+                send.assert_not_called()
+
     def test_authorization_key_with_dot(self):
         with patch.object(main.requests, 'post', return_value=Mock(status_code=403)) as send:
             with self.assertRaises(main.Retryable):
