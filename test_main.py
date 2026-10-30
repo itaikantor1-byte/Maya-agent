@@ -6,6 +6,12 @@ from unittest.mock import patch, Mock
 import main
 
 class MonitorTests(unittest.TestCase):
+    def test_authorization_key_with_dot(self):
+        with patch.object(main.requests, 'post', return_value=Mock(status_code=403)) as send:
+            with self.assertRaises(main.Retryable):
+                main.analyze([], {}, 'test-model', ' AQ.fake_abc-123\r\n')
+            self.assertEqual(send.call_args.kwargs['headers']['x-goog-api-key'], 'AQ.fake_abc-123')
+
     def test_gemini_key_copy_paste_whitespace(self):
         with patch.object(main.requests, 'post', return_value=Mock(status_code=403)) as send:
             with self.assertRaises(main.Retryable):
