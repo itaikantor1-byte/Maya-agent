@@ -252,7 +252,7 @@ FIELDS = ["decision", "duplicate_of", "company", "title", "reported_at", "summar
 def normalize_gemini_key(key):
     # API keys contain no whitespace; tolerate copy/paste line breaks.
     key = "".join(key.split())
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", key):
         raise ValueError("Invalid GEMINI_API_KEY format")
     return key
 
