@@ -259,12 +259,19 @@ def normalize_gemini_key(key):
 
 def analyze(parts, previous, model, key):
     key = normalize_gemini_key(key)
+    read_timeout = int(os.getenv("GEMINI_READ_TIMEOUT_SECONDS", "600"))
+    if not 30 <= read_timeout <= 900:
+        raise ValueError("GEMINI_READ_TIMEOUT_SECONDS must be 30..900")
+    LOG.info("Analysis request: model=%s parts=%d payload_bytes=%d timeout_seconds=%d",
+             model, len(parts), len(json.dumps(parts).encode()), read_timeout)
+    started = time.monotonic()
     schema = {"type": "object", "properties": {k: {"type": "string"} for k in FIELDS}, "required": FIELDS}
     r = requests.post("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent",
-        headers={"x-goog-api-key": key}, timeout=(10, 180), json={
+        headers={"x-goog-api-key": key}, timeout=(10, read_timeout), json={
             "systemInstruction": {"parts": [{"text": SYSTEM}]},
             "contents": [{"role": "user", "parts": [{"text": "התראות קודמות לצורך השוואה בלבד: " + json.dumps(previous, ensure_ascii=False)}] + parts}],
             "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema}})
+    LOG.info("Analysis response: HTTP %d elapsed_seconds=%.1f", r.status_code, time.monotonic() - started)
     if r.status_code != 200:
         raise Retryable("analysis HTTP " + str(r.status_code))
     try:
@@ -357,10 +364,38 @@ def deliver(state, token, chat):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--inspect", help="Read a public Maya report without Gmail, AI or Telegram")
+    parser.add_argument("--test-report", help="Analyze a public report and send a marked Telegram test; no mailbox or production state changes")
     args = parser.parse_args()
     if args.inspect:
         docs, parts = collect_documents(args.inspect)
         print(json.dumps({"documents": docs, "parts": len(parts)}, ensure_ascii=False))
+        return
+    if args.test_report:
+        stage = "documents"
+        try:
+            docs, parts = collect_documents(args.test_report)
+            print("Documents loaded:", len(docs), flush=True)
+            stage = "analysis"
+            result = analyze(parts, {}, os.environ["GEMINI_MODEL"], os.environ["GEMINI_API_KEY"])
+            print("Decision:", result["decision"], flush=True)
+            stage = "Telegram"
+            state = State(":memory:")
+            try:
+                text = "🧪 בדיקת מערכת — אינה התראה על דיווח מהותי\n\n" + alert_text(result, args.test_report, docs)
+                state.db.execute("INSERT INTO outbox(id,text) VALUES (?,?)", ("manual-test", text))
+                state.db.commit()
+                deliver(state, os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"])
+                status = state.db.execute("SELECT status FROM outbox").fetchone()[0]
+                print("Telegram:", status, flush=True)
+                if status != "sent":
+                    raise SystemExit(1)
+            finally:
+                state.db.close()
+        except Exception as exc:
+            print("Failed stage:", stage, "Error:", type(exc).__name__, flush=True)
+            if isinstance(exc, Retryable):
+                print("Details:", str(exc), flush=True)
+            raise SystemExit(1) from None
         return
     required = ["GMAIL_USER", "GMAIL_APP_PASSWORD", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "GEMINI_API_KEY", "GEMINI_MODEL", "STATE_DB"]
     missing = [k for k in required if not os.getenv(k)]
