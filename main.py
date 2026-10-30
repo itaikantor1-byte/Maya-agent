@@ -249,7 +249,16 @@ impact (חיובי/שלילי/מעורב/לא ניתן לקבוע), confidence (
 FIELDS = ["decision", "duplicate_of", "company", "title", "reported_at", "summary", "importance", "impact", "confidence", "missing"]
 
 
+def normalize_gemini_key(key):
+    # API keys contain no whitespace; tolerate copy/paste line breaks.
+    key = "".join(key.split())
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
+        raise ValueError("Invalid GEMINI_API_KEY format")
+    return key
+
+
 def analyze(parts, previous, model, key):
+    key = normalize_gemini_key(key)
     schema = {"type": "object", "properties": {k: {"type": "string"} for k in FIELDS}, "required": FIELDS}
     r = requests.post("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent",
         headers={"x-goog-api-key": key}, timeout=(10, 180), json={
