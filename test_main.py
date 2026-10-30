@@ -6,6 +6,20 @@ from unittest.mock import patch, Mock
 import main
 
 class MonitorTests(unittest.TestCase):
+    def test_gemini_key_copy_paste_whitespace(self):
+        with patch.object(main.requests, 'post', return_value=Mock(status_code=403)) as send:
+            with self.assertRaises(main.Retryable):
+                main.analyze([], {}, 'test-model', '  fake_abc-123\r\n')
+            self.assertEqual(send.call_args.kwargs['headers']['x-goog-api-key'], 'fake_abc-123')
+
+    def test_invalid_gemini_key_never_sent_or_exposed(self):
+        with patch.object(main.requests, 'post') as send:
+            for key in (' \n', 'fake"secret', 'fake\x00secret'):
+                with self.assertRaises(ValueError) as error:
+                    main.analyze([], {}, 'test-model', key)
+                self.assertEqual(str(error.exception), 'Invalid GEMINI_API_KEY format')
+            send.assert_not_called()
+
     def test_original_link_and_exact_host(self):
         msg = email.message_from_string('Content-Type: text/html; charset=utf-8\n\n<a href="https://tracking.invalid/x" data-mce-href="https://maya.tase.co.il/reports/details/1778748">report</a>', policy=policy.default)
         self.assertEqual(main.email_links(msg), ['https://maya.tase.co.il/reports/details/1778748'])
