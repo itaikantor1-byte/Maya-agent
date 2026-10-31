@@ -242,9 +242,24 @@ SYSTEM = '''אתה מנתח דיווחי מאיה עבור משקיע. כל תו
 השווה להתראות הקודמות: תרגום/אותו אירוע ללא מידע מהותי נוסף הוא duplicate.
 תיקון עם שינוי כלכלי מהותי מצדיק material. השתמש ב-duplicate_of רק במזהה קודם שקיבלת.
 החזר JSON בלבד: decision (material/not_material/unknown/duplicate), duplicate_of (מזהה או מחרוזת ריקה),
-company, title, reported_at, summary (תקציר נאמן, לא ציטוט), importance (2–4 משפטים),
+company, title, reported_at, summary (תקציר נאמן, לא ציטוט), importance (5–8 משפטים, ניתוח כלכלי מפורט),
 impact (חיובי/שלילי/מעורב/לא ניתן לקבוע), confidence (גבוהה/בינונית/נמוכה), missing.
-כל השדות מחרוזות, בעברית פרט לשדות הסיווג. סכום שדות הטקסט עד 2200 תווים.
+כל השדות מחרוזות, בעברית פרט לשדות הסיווג. סכום שדות הטקסט עד 2700 תווים; הקצה לפחות מחצית מההסבר המהותי לשדה importance.
+בשדה importance הסבר את מנגנון ההשפעה על החברה ולא רק חזור על פרטי העסקה.
+כמת ביחס לחברה כאשר קיימים במסמכים נתוני בסיס מאומתים:
+- פורטפוליו: תוספת הספק חלקי ההספק לפני העסקה כפול 100 היא שיעור הגידול;
+  תוספת חלקי ההספק לאחר העסקה כפול 100 היא חלקה בפורטפוליו לאחר הרכישה. ציין איזו הגדרה חישבת.
+  הפרד נכסים פעילים מצבר פיתוח, אגירה מייצור, בריטניה מכלל הקבוצה, MW מ-MWh וחלק חברה מ-100% פרויקט.
+- EBITDA: תוספת EBITDA שנתית צפויה חלקי EBITDA שנתי של הקבוצה כפול 100.
+  ציין סכומי מונה ומכנה, מטבע, תקופה, היקף איחוד וחלק בעלות; אל תשווה רבעון לשנה,
+  תחזית לתוצאה בלי סימון מפורש, או EBITDA פרויקטלי לנתון קבוצתי שאינו בר השוואה.
+  אל תבצע המרת מטבע ללא שער מתועד ואל תציג תחזית כגידול שכבר התממש.
+- הסבר מועד תרומה, עלות ומימון, השפעה על נזילות/חוב, הוצאות הקמה נוספות ותנאים להשלמה.
+לכל נתון בסיס ציין מסמך מקור, תאריך/תקופה ועמוד כאשר זמין. השתמש רק במסמכים שסופקו,
+לא בידע מהזיכרון ולא בקישורים מומצאים. אם נתון בסיס חסר, כתוב במפורש ב-importance וב-missing
+שלא ניתן לחשב את היחס וציין בדיוק איזה נתון חסר. אין לקבוע not_material רק משום שחסר מכנה.
+אם המכנה אפס או שלילי אל תציג אחוז צמיחה מטעה; הסבר את השינוי בסכומים.
+הבחן בין מהותיות לבין כיוון ההשפעה. נסח מסקנות כהערכה מותנית ולא כהבטחה.
 ציין תנאים וסיכונים והפרד עובדות מהערכתך. אין להבטיח תגובת מניה.'''
 FIELDS = ["decision", "duplicate_of", "company", "title", "reported_at", "summary", "importance", "impact", "confidence", "missing"]
 
@@ -299,9 +314,12 @@ def validate_analysis(a, previous):
 
 
 def alert_text(a, url, docs):
-    return (f"📢 {a['company']} — {a['title']}\n{a['reported_at']}\n\n"
+    label = {"material": "🔴 דיווח מהותי", "not_material": "⚪ דיווח לא מהותי",
+             "unknown": "⚠️ מהותיות טרם נקבעה", "duplicate": "↪️ דיווח כפול"}[a["decision"]]
+    heading = "למה הדיווח מהותי לחברה — הערכה" if a["decision"] == "material" else "נימוק הסיווג — הערכה"
+    return (f"{label}\n📢 {a['company']} — {a['title']}\n{a['reported_at']}\n\n"
             f"תקציר נאמן (לא ציטוט מלא):\n{a['summary']}\n\n"
-            f"למה זה חשוב — הערכה:\n{a['importance']}\n\n"
+            f"{heading}:\n{a['importance']}\n\n"
             f"השפעה: {a['impact']} | ביטחון: {a['confidence']}\n"
             f"מידע חסר ותנאים: {a['missing']}\n\n{url}\n" + "\n".join(docs[:2]))
 
@@ -381,7 +399,7 @@ def main():
             stage = "Telegram"
             state = State(":memory:")
             try:
-                text = "🧪 בדיקת מערכת — אינה התראה על דיווח מהותי\n\n" + alert_text(result, args.test_report, docs)
+                text = "🧪 בדיקה ידנית — סיווג הדיווח מופיע להלן\n\n" + alert_text(result, args.test_report, docs)
                 state.db.execute("INSERT INTO outbox(id,text) VALUES (?,?)", ("manual-test", text))
                 state.db.commit()
                 deliver(state, os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"])
