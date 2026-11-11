@@ -32,7 +32,11 @@ class Retryable(Exception):
     pass
 
 
-class AnalysisRateLimit(Retryable):
+class AnalysisFailure(Retryable):
+    pass
+
+
+class AnalysisRateLimit(AnalysisFailure):
     def __init__(self, retry_after):
         super().__init__("analysis HTTP 429")
         try:
@@ -86,9 +90,15 @@ def authenticated(msg):
 class State:
     def __init__(self, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path)
+        self.db = sqlite3.connect(path, timeout=30)
         self.db.executescript('''
         PRAGMA journal_mode=WAL;
+        CREATE TABLE IF NOT EXISTS company_reports(id TEXT PRIMARY KEY, issuer TEXT NOT NULL,
+          facts TEXT NOT NULL, decision TEXT NOT NULL, summary TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS company_history ON company_reports(issuer,id);
+        CREATE TABLE IF NOT EXISTS timing(id TEXT PRIMARY KEY, received REAL, ready REAL, delivered REAL);
+        CREATE TABLE IF NOT EXISTS review(id TEXT PRIMARY KEY, decision TEXT, elapsed REAL, expected TEXT, analysis TEXT);
+
         CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY,v TEXT);
         CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, subject TEXT, date TEXT, url TEXT,
           status TEXT DEFAULT 'pending', attempts INTEGER DEFAULT 0, due REAL DEFAULT 0,
@@ -124,7 +134,9 @@ def scan(state):
         if old_validity and old_validity != validity:
             # Never silently discard mail after mailbox recreation.
             raise Retryable("UIDVALIDITY changed; explicit mailbox rebaseline required")
-        status, data = mail.uid("search", None, "FROM", '"' + SENDER + '"')
+        cursor = state.get("cursor")
+        bounds = ["UID", str(int(cursor) + 1) + ":*"] if cursor is not None else []
+        status, data = mail.uid("search", None, *bounds, "FROM", '"' + SENDER + '"')
         if status != "OK":
             raise Retryable("mail search")
         ids = sorted(int(x) for x in data[0].split())
@@ -152,6 +164,12 @@ def scan(state):
                     for url in links:
                         state.db.execute("INSERT OR IGNORE INTO jobs(id,subject,date,url) VALUES (?,?,?,?)",
                                          (report_id(url), str(msg.get("Subject", "")), str(msg.get("Date", "")), url))
+                        try:
+                            received = parsedate_to_datetime(str(msg.get("Date"))).timestamp()
+                        except (ValueError, TypeError, OverflowError):
+                            received = time.time()
+                        state.db.execute("INSERT OR IGNORE INTO timing(id,received) VALUES (?,?)",
+                                         (report_id(url), received))
                 state.db.execute("INSERT OR IGNORE INTO mail VALUES (?)", (mid,))
                 state.db.execute("INSERT OR REPLACE INTO meta VALUES ('cursor',?)", (str(uid),))
 
@@ -242,7 +260,20 @@ def linked_results(page, title):
     return candidates.pop()
 
 
-def collect_documents(url):
+def latest_financial_report(page, rid):
+    titles = re.compile(r"^(?:דוח (?:רבעון|תקופתי|שנתי)|6[- ]?K.*תוצאות כספיות)", re.I)
+    candidates = []
+    for link in page.get_by_role("link", name=titles).all():
+        href = link.get_attribute("href")
+        if href:
+            url = urljoin(page.url, href)
+            other = report_id(url)
+            if other and int(other) < int(rid):
+                candidates.append((int(other), url))
+    return max(candidates)[1] if candidates else None
+
+
+def collect_documents(url, context=None):
     """Discover actual attachment tabs; never fabricate file paths."""
     from playwright.sync_api import sync_playwright
     if not report_id(url):
@@ -263,8 +294,21 @@ def collect_documents(url):
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
             urls = discover_attachments(page)
             heading = page.get_by_role("heading", level=1)
-            follow = linked_results(page, heading.inner_text())
+            title = heading.inner_text()
+            if context is not None:
+                company_link = page.get_by_role("link", name="לדף חברה", exact=True)
+                if company_link.count() == 1:
+                    path = urlsplit(company_link.get_attribute("href") or "").path
+                    match = re.fullmatch(r"/(?:he/)?companies/(\d+)/?", path)
+                    if match:
+                        context["issuer"] = match.group(1)
+                context["title"] = title
+            if context is not None and context.get("issuer"):
+                context["baseline_url"] = latest_financial_report(page, report_id(url))
+            follow = linked_results(page, title)
             if follow:
+                if context is not None:
+                    context["related_id"] = report_id(follow)
                 issuer = page.get_by_role("heading", level=3).first.inner_text()
                 page.goto(follow, wait_until="domcontentloaded", timeout=45000)
                 related_docs = discover_attachments(page)
@@ -298,7 +342,7 @@ SYSTEM = '''אתה מנתח דיווחי מאיה עבור משקיע. כל תו
 השווה להתראות הקודמות: תרגום/אותו אירוע ללא מידע מהותי נוסף הוא duplicate.
 תיקון עם שינוי כלכלי מהותי מצדיק material. השתמש ב-duplicate_of רק במזהה קודם שקיבלת.
 החזר JSON בלבד: decision (material/not_material/unknown/duplicate), duplicate_of (מזהה או מחרוזת ריקה),
-company, title, reported_at, summary (תקציר נאמן, לא ציטוט), importance (5–8 משפטים, ניתוח כלכלי מפורט),
+company, title, reported_at, summary (תקציר נאמן, לא ציטוט), importance (2–4 משפטים קצרים: מה השתנה, גודלו ביחס לחברה, איך הוא משפיע והתנאי העיקרי),
 impact (חיובי/שלילי/מעורב/לא ניתן לקבוע), confidence (גבוהה/בינונית/נמוכה), missing.
 כל השדות מחרוזות, בעברית פרט לשדות הסיווג. סכום שדות הטקסט עד 2700 תווים; הקצה לפחות מחצית מההסבר המהותי לשדה importance.
 בשדה importance הסבר את מנגנון ההשפעה על החברה ולא רק חזור על פרטי העסקה.
@@ -316,6 +360,12 @@ impact (חיובי/שלילי/מעורב/לא ניתן לקבוע), confidence (
 שלא ניתן לחשב את היחס וציין בדיוק איזה נתון חסר. אין לקבוע not_material רק משום שחסר מכנה.
 אם המכנה אפס או שלילי אל תציג אחוז צמיחה מטעה; הסבר את השינוי בסכומים.
 הבחן בין מהותיות לבין כיוון ההשפעה. נסח מסקנות כהערכה מותנית ולא כהבטחה.
+פתח את התקציר בשינוי החדש ובמספר החשוב ביותר. הצג נתוני עבר כרקע בלבד. הסבר גם סיכון איכותי
+כגון אובדן שליטה או הפרת אמת מידה מהותית. השווה תוצאות לתקופה המקבילה ולתחזית כאשר הן זמינות.
+בשדה facts החזר מערך עד 12 נתוני השוואה שפורסמו במסמכים הרשמיים המצורפים בלבד: הכנסות, EBITDA, חוב נטו,
+נזילות, תחזית ומדדים ענפיים. לכל נתון metric,value,period,scope,source,page כמחרוזות:
+כלול מטבע ויחידות בערך, תקופה ותאריך מפורשים, מגזר או מאוחד, וכתובת מדויקת מתוך המסמכים.
+הפרד ביצוע בפועל מתחזית. אם חסרה אסמכתא השמט את הנתון. בציטוט נתון קודם כלול תקופה ומקור.
 ציין תנאים וסיכונים והפרד עובדות מהערכתך. אין להבטיח תגובת מניה.'''
 FIELDS = ["decision", "duplicate_of", "company", "title", "reported_at", "summary", "importance", "impact", "confidence", "missing"]
 
@@ -337,6 +387,9 @@ def analyze(parts, previous, model, key):
              model, len(parts), len(json.dumps(parts).encode()), read_timeout)
     started = time.monotonic()
     schema = {"type": "object", "properties": {k: {"type": "string"} for k in FIELDS}, "required": FIELDS}
+    fact_fields = ("metric", "value", "period", "scope", "source", "page")
+    schema["properties"]["facts"] = {"type": "array", "items": {"type": "object",
+        "properties": {k: {"type": "string"} for k in fact_fields}, "required": list(fact_fields)}}
     r = requests.post("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent",
         headers={"x-goog-api-key": key}, timeout=(10, read_timeout), json={
             "systemInstruction": {"parts": [{"text": SYSTEM}]},
@@ -352,7 +405,13 @@ def analyze(parts, previous, model, key):
         if candidate.get("finishReason") != "STOP":
             raise ValueError("incomplete response")
         a = json.loads("".join(p.get("text", "") for p in candidate["content"]["parts"] if not p.get("thought")))
+        sources = {p["text"].removeprefix("מקור: ") for p in parts if p.get("text", "").startswith("מקור: ")}
+        facts = a.pop("facts", [])
         validate_analysis(a, previous)
+        a["facts"] = [f for f in facts if isinstance(f, dict)
+                      and all(isinstance(f.get(k), str) and len(f[k]) <= 350 for k in fact_fields)
+                      and all(f[k].strip() for k in fact_fields if k != "page")
+                      and f["source"] in sources][:12] if isinstance(facts, list) else []
         return a
     except (KeyError, IndexError, TypeError, ValueError):
         raise Retryable("invalid analysis result") from None
@@ -382,12 +441,130 @@ def alert_text(a, url, docs):
             f"מידע חסר ותנאים: {a['missing']}\n\n{url}\n" + "\n".join(docs[:2]))
 
 
+URGENT = re.compile(r"אזהרת רווח|תחזית|הפרת|חדלות פירעון|הסדר חוב|שינוי שליטה|ביטול הסכם|הורדת דירוג|הפסקת מסחר|תוצאות כספיות|תוצאותיה הכספיות")
+
+
+def company_context(state, issuer, rid):
+    rows = state.db.execute(
+        "SELECT id,summary,facts,decision FROM company_reports WHERE issuer=? AND CAST(id AS INTEGER)<? "
+        "ORDER BY CAST(id AS INTEGER) DESC LIMIT 50", (issuer, int(rid))).fetchall()
+    history = {i: summary for i, summary, _, decision in rows if decision == "material"}
+    facts = []
+    seen = set()
+    for _, _, encoded, _ in rows:
+        for f in json.loads(encoded):
+            identity = tuple(f[k] for k in ("metric", "period", "scope", "value"))
+            if identity not in seen:
+                facts.append(f)
+                seen.add(identity)
+                if len(facts) == 36:
+                    return history, facts
+    return history, facts
+
+
+def evaluate(state, rid, url, model, key, historical=False):
+    context = {}
+    docs, parts = collect_documents(url, context)
+    issuer = context.get("issuer", "")
+    previous, facts = company_context(state, issuer, rid) if issuer else ({}, [])
+    baseline = context.get("baseline_url")
+    cached_baseline = state.db.execute("SELECT facts FROM company_reports WHERE issuer=? AND id=?",
+                                       (issuer, report_id(baseline))).fetchone() if baseline else None
+    if baseline and baseline != url and not cached_baseline and (historical or report_id(baseline) != state.get("basis:" + issuer) or not facts):
+        try:
+            _, reference_parts = collect_documents(baseline)
+            if len(json.dumps(parts)) + len(json.dumps(reference_parts)) < 18 * 1024 * 1024:
+                parts.extend([{"text": "סוף הדיווח הנוכחי. להלן דוח רשמי קודם של החברה להשוואה בלבד. "
+                               "חלץ ממנו נתוני בסיס עם מקור ותקופה. אל תייחס חדשות ממנו לאירוע הנוכחי."},
+                              *reference_parts])
+        except Exception as exc:
+            LOG.info("Historical comparison unavailable for %s (%s)", rid, type(exc).__name__)
+    # Include alerts generated before issuer IDs were recorded.
+    legacy = state.db.execute("SELECT s.id,s.analysis FROM sent s LEFT JOIN company_reports c ON c.id=s.id "
+                              "WHERE c.id IS NULL AND CAST(s.id AS INTEGER)<? ORDER BY s.rowid DESC LIMIT 100", (int(rid),))
+    previous.update(dict(legacy))
+    related_id = context.get("related_id")
+    if related_id and not historical:
+        sent = state.db.execute("SELECT analysis FROM sent WHERE id=?", (related_id,)).fetchone()
+        if sent:
+            previous[related_id] = sent[0]
+    if facts:
+        parts.insert(0, {"text": "רקע היסטורי בלבד – נתוני החברה מדיווחים קודמים: " + json.dumps(facts, ensure_ascii=False)})
+    try:
+        a = analyze(parts, previous, model, key)
+    except AnalysisRateLimit:
+        raise
+    except Exception as exc:
+        raise AnalysisFailure("analysis request failed") from exc
+    if baseline and not historical and any(f.get("source") not in docs for f in a.get("facts", [])):
+        state.set("basis:" + issuer, report_id(baseline))
+    if a["decision"] == "material":
+        cited = [f["source"] for f in facts if f["source"] in a["importance"]]
+        docs = list(dict.fromkeys(docs + cited))
+    if context.get("title"):
+        a["title"] = context["title"]
+    return a, docs, issuer
+
+
+def pause_analysis(state, exc):
+    backoff = min(21600, max(900, int(state.get("analysis_backoff") or 0) * 2))
+    delay = max(backoff, exc.delay)
+    with state.db:
+        state.db.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)", [
+            ("analysis_resume", str(time.time() + delay)),
+            ("analysis_backoff", str(backoff)), ("recovery_jobs", "5")])
+    LOG.warning("Analysis paused after HTTP 429 for %.0f seconds; queued reports retained", delay)
+
+
+def replay_one(state, model, key):
+    # Bounded silent rollout evaluation, run only during idle time.
+    if time.time() < float(state.get("review_next") or 0):
+        return
+    count = state.db.execute("SELECT COUNT(*) FROM review").fetchone()[0]
+    if count >= 8:
+        state.set("review_next", 1e12)
+        return
+    state.set("review_next", time.time() + 900)
+    row = state.db.execute(
+        "SELECT id,url FROM jobs WHERE analysis IS NOT NULL AND status='done' AND rowid<=? "
+        "AND id NOT IN (SELECT id FROM review) "
+        "ORDER BY CASE WHEN json_extract(analysis,'$.analysis.decision')=? THEN 0 ELSE 1 END,rowid DESC LIMIT 1",
+        (state.get("review_boundary"), "material" if count % 2 == 0 else "not_material")).fetchone()
+    if not row:
+        return
+    rid, url = row
+    start = time.monotonic()
+    try:
+        a, _, _ = evaluate(state, rid, url, model, key, historical=True)
+        decision = a["decision"]
+        detail = json.dumps(a, ensure_ascii=False)
+    except AnalysisRateLimit as exc:
+        pause_analysis(state, exc)
+        return
+    except Exception:
+        decision = "unknown"
+        detail = None
+    with state.db:
+        state.db.execute("INSERT OR IGNORE INTO review(id,decision,elapsed,analysis) VALUES (?,?,?,?)",
+                         (rid, decision, round(time.monotonic() - start, 2), detail))
+    LOG.info("Silent historical review report=%s decision=%s", rid, decision)
+
+
 def process(state, model, key):
     cooldown = float(state.get("analysis_resume") or 0)
     if time.time() < cooldown:
         return
     jobs = state.db.execute("SELECT id,subject,date,url,analysis,attempts,notice FROM jobs WHERE status='pending' AND due<=? ORDER BY rowid", (time.time(),)).fetchall()
-    for rid, subject, date, url, cached, attempts, notice in jobs:
+    if not jobs and not cooldown:
+        replay_one(state, model, key)
+        return
+    # Reserve one in five dispatches for FIFO when both queues have work.
+    if jobs and any(URGENT.search(row[1] or "") for row in jobs) and any(not URGENT.search(row[1] or "") for row in jobs):
+        turn = int(state.get("priority_turn") or 0)
+        if turn % 5 != 4:
+            jobs.sort(key=lambda row: not bool(URGENT.search(row[1] or "")))
+        state.set("priority_turn", (turn + 1) % 5)
+    for rid, subject, date, url, cached, attempts, notice in jobs[:1]:
         if STOP.is_set():
             break
         stage = "documents"
@@ -395,16 +572,19 @@ def process(state, model, key):
             if cached:
                 saved = json.loads(cached)
                 a, docs = saved["analysis"], saved["docs"]
+                issuer = saved.get("issuer", "")
             else:
-                docs, parts = collect_documents(url)
-                previous = dict(state.db.execute("SELECT id,analysis FROM sent ORDER BY rowid DESC LIMIT 100").fetchall())
+                a, docs, issuer = evaluate(state, rid, url, model, key)
                 stage = "analysis"
-                a = analyze(parts, previous, model, key)
                 if a["decision"] == "unknown":
                     raise Retryable("model could not verify content")
-                state.db.execute("UPDATE jobs SET analysis=? WHERE id=?", (json.dumps({"analysis": a, "docs": docs}, ensure_ascii=False), rid))
+                state.db.execute("UPDATE jobs SET analysis=? WHERE id=?", (json.dumps({"analysis": a, "docs": docs, "issuer": issuer}, ensure_ascii=False), rid))
                 state.db.commit()
             with state.db:
+                if issuer:
+                    state.db.execute("INSERT OR REPLACE INTO company_reports VALUES (?,?,?,?,?)",
+                                     (rid, issuer, json.dumps(a.get("facts", []), ensure_ascii=False), a["decision"], a["summary"]))
+                state.db.execute("UPDATE timing SET ready=? WHERE id=?", (time.time(), rid))
                 if a["decision"] == "material":
                     state.db.execute("INSERT OR IGNORE INTO outbox(id,text) VALUES (?,?)", (rid, alert_text(a, url, docs)))
                     # Include queued alerts for dedup even before Telegram delivery.
@@ -421,15 +601,11 @@ def process(state, model, key):
                         state.db.execute("DELETE FROM meta WHERE k IN ('analysis_resume','analysis_backoff','recovery_jobs')")
                 return
         except AnalysisRateLimit as exc:
-            backoff = min(21600, max(900, int(state.get("analysis_backoff") or 0) * 2))
-            delay = max(backoff, exc.delay)
-            with state.db:
-                state.db.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)", [
-                    ("analysis_resume", str(time.time() + delay)),
-                    ("analysis_backoff", str(backoff)), ("recovery_jobs", "5")])
-            LOG.warning("Analysis paused after HTTP 429 for %.0f seconds; queued reports retained", delay)
+            pause_analysis(state, exc)
             return
         except Exception as exc:
+            if isinstance(exc, AnalysisFailure):
+                stage = "analysis"
             # Never log exception strings: HTTP clients may include token-bearing URLs.
             LOG.warning("Report %s failed at %s (%s), attempt %d", rid, stage, type(exc).__name__, attempts + 1)
             if attempts + 1 < 3:
@@ -456,6 +632,7 @@ def deliver(state, token, chat):
                               json={"chat_id": chat, "text": text, "link_preview_options": {"is_disabled": True}})
             if r.status_code == 200 and r.json().get("ok") is True:
                 state.db.execute("UPDATE outbox SET status='sent' WHERE id=?", (rid,))
+                state.db.execute("UPDATE timing SET delivered=? WHERE id=?", (time.time(), rid))
                 state.db.commit()
                 LOG.info("Alert %s delivered", rid)
             else:
@@ -466,11 +643,44 @@ def deliver(state, token, chat):
             break
 
 
+def run_loop(path, name, interval, action, args):
+    state = State(path)
+    try:
+        while not STOP.is_set():
+            try:
+                action(state, *args)
+            except Exception as exc:
+                LOG.warning("%s cycle failed (%s)", name, type(exc).__name__)
+            STOP.wait(interval)
+    finally:
+        state.db.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--inspect", help="Read a public Maya report without Gmail, AI or Telegram")
     parser.add_argument("--test-report", help="Analyze a public report and send a marked Telegram test; no mailbox or production state changes")
+    parser.add_argument("--review", action="store_true", help="Print silent replay results and live mail-to-ready latency")
+    parser.add_argument("--label", nargs=2, metavar=("REPORT", "DECISION"), help="Record a human replay label")
     args = parser.parse_args()
+    if args.review or args.label:
+        state = State(os.environ["STATE_DB"])
+        if args.label:
+            rid, label = args.label
+            if label not in {"material", "not_material", "duplicate", "unknown"}:
+                parser.error("invalid decision")
+            with state.db:
+                if not state.db.execute("UPDATE review SET expected=? WHERE id=?", (label, rid)).rowcount:
+                    parser.error("report not in replay set")
+        rows = state.db.execute("SELECT id,decision,expected,elapsed,analysis FROM review ORDER BY rowid").fetchall()
+        delays = [round(row[0]) for row in state.db.execute("SELECT ready-received FROM timing WHERE ready>=received ORDER BY ready-received")]
+        print(json.dumps({"reports": rows, "labeled": sum(bool(r[2]) for r in rows),
+                          "missed": sum(r[2]=="material" and r[1]!="material" for r in rows),
+                          "unwanted": sum(r[2] in ("not_material","duplicate") and r[1]=="material" for r in rows),
+                          "live_samples": len(delays), "p90_seconds": delays[(9*len(delays)-1)//10] if delays else None},
+                         ensure_ascii=False))
+        state.db.close()
+        return
     if args.inspect:
         docs, parts = collect_documents(args.inspect)
         print(json.dumps({"documents": docs, "parts": len(parts)}, ensure_ascii=False))
@@ -511,16 +721,19 @@ def main():
     state = State(os.environ["STATE_DB"])
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: STOP.set())
-    LOG.info("Maya monitor started")
-    while not STOP.is_set():
-        try:
-            scan(state)
-        except Exception as exc:
-            LOG.warning("Mailbox check incomplete (%s)", type(exc).__name__)
-        process(state, os.environ["GEMINI_MODEL"], os.environ["GEMINI_API_KEY"])
-        deliver(state, os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"])
-        STOP.wait(180)
+    if state.get("review_boundary") is None:
+        state.set("review_boundary", state.db.execute("SELECT COALESCE(MAX(rowid),0) FROM jobs").fetchone()[0])
     state.db.close()
+    loops = [("mail", 30, scan, ()),
+             ("analysis", 2, process, (os.environ["GEMINI_MODEL"], os.environ["GEMINI_API_KEY"])),
+             ("delivery", 5, deliver, (os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"]))]
+    workers = [threading.Thread(target=run_loop, args=(os.environ["STATE_DB"], *loop),
+                                name=loop[0]) for loop in loops]
+    for worker in workers:
+        worker.start()
+    LOG.info("Maya monitor started with independent mail, analysis and delivery loops")
+    for worker in workers:
+        worker.join()
 
 
 if __name__ == "__main__":
