@@ -13,7 +13,7 @@ import sqlite3
 import threading
 import time
 from email import policy
-from email.utils import parseaddr
+from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
@@ -30,6 +30,18 @@ MAX_BYTES = 12 * 1024 * 1024
 
 class Retryable(Exception):
     pass
+
+
+class AnalysisRateLimit(Retryable):
+    def __init__(self, retry_after):
+        super().__init__("analysis HTTP 429")
+        try:
+            self.delay = max(0, int(retry_after))
+        except (TypeError, ValueError):
+            try:
+                self.delay = max(0, parsedate_to_datetime(retry_after).timestamp() - time.time())
+            except (TypeError, ValueError, OverflowError):
+                self.delay = 0
 
 
 def report_id(url):
@@ -168,6 +180,8 @@ def download(url):
             soup = BeautifulSoup(data, "html.parser")
             for tag in soup(["script", "style", "nav"]):
                 tag.decompose()
+            for field in soup.select('input[value]:not([type]), input[type="text"][value]'):
+                field.replace_with(field["value"])
             text = soup.get_text("\n", strip=True)
             if len(text) < 150 or any(x in text.lower() for x in ("access denied", "verify you are human")):
                 raise Retryable("unreadable HTML")
@@ -175,6 +189,57 @@ def download(url):
                 raise Retryable("HTML exceeds context limit")
             return {"text": text}
     raise Retryable("document redirect limit")
+
+
+PDF_TAB = re.compile(r"^PDF(?:\s*\d+)?(?:\s|$)", re.I)
+
+
+def discover_attachments(page):
+    from playwright.sync_api import expect
+    urls = set()
+    full = page.get_by_role("link", name=re.compile("צפה במסך מלא"))
+    full.wait_for(timeout=30000)
+    first = full.get_attribute("href")
+    if document_url(first or ""):
+        urls.add(first)
+    tabs = page.get_by_role("link", name=PDF_TAB)
+    count = tabs.count()
+    if count > 12:
+        raise Retryable("too many attachments for one request")
+    for i in range(count):
+        previous = full.get_attribute("href")
+        if i == 0 and previous and previous.lower().endswith(".pdf"):
+            urls.add(previous)
+            continue
+        tabs.nth(i).click()
+        # Wait for actual selected attachment, not stale HTML href.
+        if previous:
+            expect(full).not_to_have_attribute("href", previous, timeout=20000)
+        expect(full).to_have_attribute("href", re.compile(r"\.pdf(?:[?#].*)?$", re.I), timeout=20000)
+        target = full.get_attribute("href")
+        if not document_url(target or ""):
+            raise Retryable("attachment link unavailable")
+        urls.add(target)
+    return urls
+
+
+def linked_results(page, title):
+    """Match the issuer's quarterly results in Maya's company report list."""
+    period = re.compile(r"רבעון\s+([1-4])\s+(?:לשנת\s+)?(20\d{2})")
+    quarter = period.search(title)
+    if not quarter or not re.search(r'פורסמו בחו["״]ל', title):
+        return None
+    links = page.get_by_role("link", name=re.compile(r"6[- ]?K.*תוצאות כספיות", re.I))
+    candidates = set()
+    for link in links.all():
+        match = period.search(link.inner_text())
+        if match and match.groups() == quarter.groups():
+            url = urljoin(page.url, link.get_attribute("href") or "")
+            if report_id(url) and report_id(url) != report_id(page.url):
+                candidates.add(url)
+    if len(candidates) != 1:
+        raise Retryable("matching quarterly results filing unavailable or ambiguous")
+    return candidates.pop()
 
 
 def collect_documents(url):
@@ -196,27 +261,18 @@ def collect_documents(url):
         page = context.new_page()
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            full = page.get_by_role("link", name=re.compile("צפה במסך מלא"))
-            full.wait_for(timeout=30000)
-            first = full.get_attribute("href")
-            if document_url(first or ""):
-                urls.add(first)
-            tabs = page.get_by_role("link", name=re.compile(r"^pdf\s*\d*\s"))
-            count = tabs.count()
-            if count > 12:
-                raise Retryable("too many attachments for one request")
-            for i in range(count):
-                previous = full.get_attribute("href")
-                if i == 0 and previous and previous.lower().endswith(".pdf"):
-                    urls.add(previous)
-                    continue
-                tabs.nth(i).click()
-                # Wait for actual selected attachment, not stale HTML href.
-                page.wait_for_function("([old,host]) => [...document.querySelectorAll('a')].some(a => a.textContent.includes('צפה במסך מלא') && a.href !== old && a.href.includes(host) && a.href.includes('.pdf'))", arg=[previous, DOC_HOST], timeout=20000)
-                target = full.get_attribute("href")
-                if not document_url(target or ""):
-                    raise Retryable("attachment link unavailable")
-                urls.add(target)
+            urls = discover_attachments(page)
+            heading = page.get_by_role("heading", level=1)
+            follow = linked_results(page, heading.inner_text())
+            if follow:
+                issuer = page.get_by_role("heading", level=3).first.inner_text()
+                page.goto(follow, wait_until="domcontentloaded", timeout=45000)
+                related_docs = discover_attachments(page)
+                if page.get_by_role("heading", level=3).first.inner_text() != issuer:
+                    raise Retryable("related filing issuer mismatch")
+                if not related_docs or not any(urlsplit(doc).path.lower().endswith(".pdf") for doc in related_docs):
+                    raise Retryable("quarterly results attachment unavailable")
+                urls.update(related_docs)
         finally:
             browser.close()
     if not urls:
@@ -287,6 +343,8 @@ def analyze(parts, previous, model, key):
             "contents": [{"role": "user", "parts": [{"text": "התראות קודמות לצורך השוואה בלבד: " + json.dumps(previous, ensure_ascii=False)}] + parts}],
             "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema}})
     LOG.info("Analysis response: HTTP %d elapsed_seconds=%.1f", r.status_code, time.monotonic() - started)
+    if r.status_code == 429:
+        raise AnalysisRateLimit(r.headers.get("Retry-After"))
     if r.status_code != 200:
         raise Retryable("analysis HTTP " + str(r.status_code))
     try:
@@ -325,10 +383,14 @@ def alert_text(a, url, docs):
 
 
 def process(state, model, key):
+    cooldown = float(state.get("analysis_resume") or 0)
+    if time.time() < cooldown:
+        return
     jobs = state.db.execute("SELECT id,subject,date,url,analysis,attempts,notice FROM jobs WHERE status='pending' AND due<=? ORDER BY rowid", (time.time(),)).fetchall()
     for rid, subject, date, url, cached, attempts, notice in jobs:
         if STOP.is_set():
             break
+        stage = "documents"
         try:
             if cached:
                 saved = json.loads(cached)
@@ -336,6 +398,7 @@ def process(state, model, key):
             else:
                 docs, parts = collect_documents(url)
                 previous = dict(state.db.execute("SELECT id,analysis FROM sent ORDER BY rowid DESC LIMIT 100").fetchall())
+                stage = "analysis"
                 a = analyze(parts, previous, model, key)
                 if a["decision"] == "unknown":
                     raise Retryable("model could not verify content")
@@ -347,15 +410,39 @@ def process(state, model, key):
                     # Include queued alerts for dedup even before Telegram delivery.
                     state.db.execute("INSERT OR REPLACE INTO sent VALUES (?,?)", (rid, json.dumps(a, ensure_ascii=False)))
                 state.db.execute("UPDATE jobs SET status='done' WHERE id=?", (rid,))
+            if cooldown and not cached:
+                remaining = int(state.get("recovery_jobs") or 0)
+                with state.db:
+                    if remaining > 1:
+                        state.db.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)", [
+                            ("analysis_resume", str(time.time() + 180)),
+                            ("recovery_jobs", str(remaining - 1))])
+                    else:
+                        state.db.execute("DELETE FROM meta WHERE k IN ('analysis_resume','analysis_backoff','recovery_jobs')")
+                return
+        except AnalysisRateLimit as exc:
+            backoff = min(21600, max(900, int(state.get("analysis_backoff") or 0) * 2))
+            delay = max(backoff, exc.delay)
+            with state.db:
+                state.db.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)", [
+                    ("analysis_resume", str(time.time() + delay)),
+                    ("analysis_backoff", str(backoff)), ("recovery_jobs", "5")])
+            LOG.warning("Analysis paused after HTTP 429 for %.0f seconds; queued reports retained", delay)
+            return
         except Exception as exc:
             # Never log exception strings: HTTP clients may include token-bearing URLs.
-            LOG.warning("Report %s pending (%s)", rid, type(exc).__name__)
-            state.retry(rid)
-            if attempts >= 2 and not notice:
-                text = f"⚠️ לא ניתן לאמת דיווח מאיה\n{subject}\n{date}\nקריאת המסמך או ניתוחו נכשלו במספר ניסיונות. המהותיות וכיוון ההשפעה טרם נקבעו; הבוט ינסה שוב.\n{url}"
+            LOG.warning("Report %s failed at %s (%s), attempt %d", rid, stage, type(exc).__name__, attempts + 1)
+            if attempts + 1 < 3:
+                state.retry(rid)
+            else:
                 with state.db:
-                    state.db.execute("INSERT OR IGNORE INTO outbox(id,text) VALUES (?,?)", ("access:" + rid, text))
-                    state.db.execute("UPDATE jobs SET notice=1 WHERE id=?", (rid,))
+                    state.db.execute("UPDATE jobs SET status='unverified', attempts=attempts+1 WHERE id=?", (rid,))
+                    if stage == "documents" and not notice and re.search(
+                        r"תוצאותיה הכספיות|תוצאות כספיות|שינוי שליטה|הסכם (?:מחייב|מהותי)|מיזוג|רכישת שליטה|עדכון תחזית|אזהרת רווח|הורדת דירוג|הסדר חוב", subject or ""
+                    ):
+                        message = f"⚠️ דיווח בעל פוטנציאל מהותי — המסמך לא אומת\n{subject}\n{date}\n{url}"
+                        state.db.execute("INSERT OR IGNORE INTO outbox(id,text) VALUES (?,?)", ("access:" + rid, message))
+                        state.db.execute("UPDATE jobs SET notice=1 WHERE id=?", (rid,))
 
 
 def deliver(state, token, chat):
