@@ -431,16 +431,74 @@ def analyze(parts, previous, model, key):
         if candidate.get("finishReason") != "STOP":
             raise ValueError("incomplete response")
         a = json.loads("".join(p.get("text", "") for p in candidate["content"]["parts"] if not p.get("thought")))
-        sources = {p["text"].removeprefix("מקור: ") for p in parts if p.get("text", "").startswith("מקור: ")}
-        facts = a.pop("facts", [])
-        validate_analysis(a, previous)
-        a["facts"] = [f for f in facts if isinstance(f, dict)
-                      and all(isinstance(f.get(k), str) and len(f[k]) <= 350 for k in fact_fields)
-                      and all(f[k].strip() for k in fact_fields if k != "page")
-                      and f["source"] in sources][:12] if isinstance(facts, list) else []
-        return a
+        return checked_result(a, parts, previous)
     except (KeyError, IndexError, TypeError, ValueError):
         raise Retryable("invalid analysis result") from None
+
+
+def checked_result(a, parts, previous):
+    if not isinstance(a, dict):
+        raise ValueError("invalid result")
+    fact_fields = ("metric", "value", "period", "scope", "source", "page")
+    sources = {p["text"].removeprefix("מקור: ") for p in parts if p.get("text", "").startswith("מקור: ")}
+    facts = a.pop("facts", [])
+    validate_analysis(a, previous)
+    a["facts"] = [f for f in facts if isinstance(f, dict)
+                  and all(isinstance(f.get(k), str) and len(f[k]) <= 350 for k in fact_fields)
+                  and all(f[k].strip() for k in fact_fields if k != "page")
+                  and f["source"] in sources][:12] if isinstance(facts, list) else []
+    return a
+
+
+def analyze_backup(parts, previous, api_key):
+    content = [{"type": "input_text", "text": "התראות קודמות להשוואה בלבד: " + json.dumps(previous, ensure_ascii=False)}]
+    for i, part in enumerate(parts):
+        if "text" in part:
+            content.append({"type": "input_text", "text": part["text"]})
+        else:
+            pdf = part["inlineData"]
+            if pdf["mimeType"] != "application/pdf":
+                raise ValueError("unsupported document")
+            content.append({"type": "input_file", "filename": f"report-{i}.pdf",
+                            "file_data": "data:application/pdf;base64," + pdf["data"]})
+    model = "gpt-5.4-mini"
+    response = requests.post("https://api.openai.com/v1/responses",
+        headers={"Authorization": "Bearer " + api_key}, timeout=(10, 180),
+        json={"model": model, "store": False, "instructions": SYSTEM,
+              "input": [{"role": "user", "content": content}],
+              "text": {"format": {"type": "json_object"}}, "max_output_tokens": 4500})
+    LOG.info("Backup analysis HTTP %d", response.status_code)
+    response.raise_for_status()
+    body = response.json()
+    if body.get("status") != "completed":
+        raise ValueError("incomplete backup response")
+    answer = "".join(item["text"] for msg in body["output"] if msg.get("type") == "message"
+                     for item in msg["content"] if item.get("type") == "output_text")
+    return checked_result(json.loads(answer), parts, previous)
+
+
+def analyze_with_backup(state, parts, previous, model, key):
+    backup_key = os.getenv("OPENAI_API_KEY", "").strip()
+    resume = float(state.get("gemini_resume") or 0)
+    if not backup_key or time.time() >= resume:
+        try:
+            return analyze(parts, previous, model, key)
+        except AnalysisRateLimit as exc:
+            if not backup_key:
+                raise
+            state.set("gemini_resume", time.time() + max(exc.delay, 900 if exc.status == 429 else 60))
+        except (requests.Timeout, requests.ConnectionError):
+            if not backup_key:
+                raise
+            state.set("gemini_resume", time.time() + 60)
+    try:
+        return analyze_backup(parts, previous, backup_key)
+    except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
+        # Both routes unavailable. Preserve this job and pause the queue.
+        response = getattr(exc, "response", None)
+        wait = response.headers.get("Retry-After") if response is not None else None
+        status = 429 if response is not None and response.status_code == 429 else 503
+        raise AnalysisRateLimit(wait, status) from None
 
 
 def validate_analysis(a, previous):
@@ -505,7 +563,7 @@ def evaluate(state, rid, url, model, key, historical=False):
     if facts:
         parts.insert(0, {"text": "רקע היסטורי בלבד – נתוני החברה מדיווחים קודמים: " + json.dumps(facts, ensure_ascii=False)})
     try:
-        a = analyze(parts, previous, model, key)
+        a = analyze_with_backup(state, parts, previous, model, key)
     except AnalysisRateLimit:
         raise
     except Exception as exc:
@@ -774,6 +832,17 @@ def main():
     state = State(os.environ["STATE_DB"])
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: STOP.set())
+    backup_configured = bool(os.getenv("OPENAI_API_KEY", "").strip())
+    LOG.info("OpenAI backup configured=%s", backup_configured)
+    if backup_configured and state.get("backup_enabled") != "1":
+        with state.db:
+            cooldown = state.get("analysis_resume")
+            if cooldown:
+                state.db.execute("INSERT OR REPLACE INTO meta VALUES ('gemini_resume',?)", (cooldown,))
+                state.db.execute("DELETE FROM meta WHERE k IN ('analysis_resume','analysis_backoff','recovery_jobs')")
+            state.db.execute("INSERT OR REPLACE INTO meta VALUES ('backup_enabled','1')")
+    elif not backup_configured:
+        state.set("backup_enabled", "0")
     skip_old_reports(state)
     state.db.close()
     loops = [("mail", 30, scan, ()),
