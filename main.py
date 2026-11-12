@@ -28,6 +28,32 @@ DOC_HOST = "mayafiles.tase.co.il"
 MAX_BYTES = 12 * 1024 * 1024
 
 
+NEW_REPORTS_FROM = 1794503635  # User-requested cutoff, UTC epoch seconds.
+
+
+def published_since_cutoff(date):
+    try:
+        stamp = parsedate_to_datetime(str(date))
+        return stamp.tzinfo is not None and stamp.timestamp() >= NEW_REPORTS_FROM
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
+def skip_old_reports(state):
+    with state.db:
+        rows = state.db.execute("SELECT id,date FROM jobs WHERE status='pending'").fetchall()
+        skipped = [rid for rid, date in rows if not published_since_cutoff(date)]
+        state.db.executemany("UPDATE jobs SET status='skipped_cutoff' WHERE id=?", [(r,) for r in skipped])
+        messages = state.db.execute("SELECT id FROM outbox WHERE status='pending'").fetchall()
+        suppressed = []
+        for (mid,) in messages:
+            job = state.db.execute("SELECT date FROM jobs WHERE id=?", (mid.removeprefix("access:"),)).fetchone()
+            if not job or not published_since_cutoff(job[0]):
+                suppressed.append((mid,))
+        state.db.executemany("UPDATE outbox SET status='skipped_cutoff' WHERE id=?", suppressed)
+    LOG.info("New reports only: %d pending reports and %d queued alerts skipped; historical replay off", len(skipped), len(suppressed))
+
+
 class Retryable(Exception):
     pass
 
@@ -158,7 +184,7 @@ def scan(state):
             msg = email.message_from_bytes(raw, policy=policy.default)
             mid = str(msg.get("Message-ID") or hashlib.sha256(raw).hexdigest())
             with state.db:
-                if authenticated(msg) and not state.db.execute("SELECT 1 FROM mail WHERE id=?", (mid,)).fetchone():
+                if published_since_cutoff(msg.get("Date")) and authenticated(msg) and not state.db.execute("SELECT 1 FROM mail WHERE id=?", (mid,)).fetchone():
                     links = email_links(msg)
                     if not links:
                         raise Retryable("Maya mail has no supported original report link")
@@ -304,8 +330,6 @@ def collect_documents(url, context=None):
                     if match:
                         context["issuer"] = match.group(1)
                 context["title"] = title
-            if context is not None and context.get("issuer"):
-                context["baseline_url"] = latest_financial_report(page, report_id(url))
             follow = linked_results(page, title)
             if follow:
                 if context is not None:
@@ -469,18 +493,6 @@ def evaluate(state, rid, url, model, key, historical=False):
     docs, parts = collect_documents(url, context)
     issuer = context.get("issuer", "")
     previous, facts = company_context(state, issuer, rid) if issuer else ({}, [])
-    baseline = context.get("baseline_url")
-    cached_baseline = state.db.execute("SELECT facts FROM company_reports WHERE issuer=? AND id=?",
-                                       (issuer, report_id(baseline))).fetchone() if baseline else None
-    if baseline and baseline != url and not cached_baseline and (historical or report_id(baseline) != state.get("basis:" + issuer) or not facts):
-        try:
-            _, reference_parts = collect_documents(baseline)
-            if len(json.dumps(parts)) + len(json.dumps(reference_parts)) < 18 * 1024 * 1024:
-                parts.extend([{"text": "סוף הדיווח הנוכחי. להלן דוח רשמי קודם של החברה להשוואה בלבד. "
-                               "חלץ ממנו נתוני בסיס עם מקור ותקופה. אל תייחס חדשות ממנו לאירוע הנוכחי."},
-                              *reference_parts])
-        except Exception as exc:
-            LOG.info("Historical comparison unavailable for %s (%s)", rid, type(exc).__name__)
     # Include alerts generated before issuer IDs were recorded.
     legacy = state.db.execute("SELECT s.id,s.analysis FROM sent s LEFT JOIN company_reports c ON c.id=s.id "
                               "WHERE c.id IS NULL AND CAST(s.id AS INTEGER)<? ORDER BY s.rowid DESC LIMIT 100", (int(rid),))
@@ -498,8 +510,6 @@ def evaluate(state, rid, url, model, key, historical=False):
         raise
     except Exception as exc:
         raise AnalysisFailure("analysis request failed") from exc
-    if baseline and not historical and any(f.get("source") not in docs for f in a.get("facts", [])):
-        state.set("basis:" + issuer, report_id(baseline))
     if a["decision"] == "material":
         cited = [f["source"] for f in facts if f["source"] in a["importance"]]
         docs = list(dict.fromkeys(docs + cited))
@@ -557,8 +567,7 @@ def process(state, model, key):
     if time.time() < cooldown:
         return
     jobs = state.db.execute("SELECT id,subject,date,url,analysis,attempts,notice FROM jobs WHERE status='pending' AND due<=? ORDER BY rowid", (time.time(),)).fetchall()
-    if not jobs and not cooldown:
-        replay_one(state, model, key)
+    if not jobs:
         return
     # Reserve one in five dispatches for FIFO when both queues have work.
     if jobs and any(URGENT.search(row[1] or "") for row in jobs) and any(not URGENT.search(row[1] or "") for row in jobs):
@@ -765,9 +774,7 @@ def main():
     state = State(os.environ["STATE_DB"])
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: STOP.set())
-    recover_document_jobs(state)
-    if state.get("review_boundary") is None:
-        state.set("review_boundary", state.db.execute("SELECT COALESCE(MAX(rowid),0) FROM jobs").fetchone()[0])
+    skip_old_reports(state)
     state.db.close()
     loops = [("mail", 30, scan, ()),
              ("analysis", 2, process, (os.environ["GEMINI_MODEL"], os.environ["GEMINI_API_KEY"])),
