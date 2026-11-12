@@ -37,8 +37,9 @@ class AnalysisFailure(Retryable):
 
 
 class AnalysisRateLimit(AnalysisFailure):
-    def __init__(self, retry_after):
-        super().__init__("analysis HTTP 429")
+    def __init__(self, retry_after, status=429):
+        self.status = status
+        super().__init__(f"analysis HTTP {status}")
         try:
             self.delay = max(0, int(retry_after))
         except (TypeError, ValueError):
@@ -396,8 +397,9 @@ def analyze(parts, previous, model, key):
             "contents": [{"role": "user", "parts": [{"text": "התראות קודמות לצורך השוואה בלבד: " + json.dumps(previous, ensure_ascii=False)}] + parts}],
             "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema}})
     LOG.info("Analysis response: HTTP %d elapsed_seconds=%.1f", r.status_code, time.monotonic() - started)
-    if r.status_code == 429:
-        raise AnalysisRateLimit(r.headers.get("Retry-After"))
+    if r.status_code in (429, 500, 502, 503, 504):
+        retry_after = r.headers.get("Retry-After")
+        raise AnalysisRateLimit(retry_after if isinstance(retry_after, str) else None, r.status_code)
     if r.status_code != 200:
         raise Retryable("analysis HTTP " + str(r.status_code))
     try:
@@ -507,13 +509,13 @@ def evaluate(state, rid, url, model, key, historical=False):
 
 
 def pause_analysis(state, exc):
-    backoff = min(21600, max(900, int(state.get("analysis_backoff") or 0) * 2))
+    backoff = min(21600, max(900 if exc.status == 429 else 60, int(state.get("analysis_backoff") or 0) * 2))
     delay = max(backoff, exc.delay)
     with state.db:
         state.db.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)", [
             ("analysis_resume", str(time.time() + delay)),
             ("analysis_backoff", str(backoff)), ("recovery_jobs", "5")])
-    LOG.warning("Analysis paused after HTTP 429 for %.0f seconds; queued reports retained", delay)
+    LOG.warning("Analysis paused after HTTP %d for %.0f seconds; queued reports retained", exc.status, delay)
 
 
 def replay_one(state, model, key):
