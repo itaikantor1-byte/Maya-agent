@@ -408,12 +408,12 @@ def normalize_gemini_key(key):
     return key
 
 
-def analyze(parts, previous, model, key):
+def analyze(parts, previous, model, key, *, backup_available=None):
     key = normalize_gemini_key(key)
     read_timeout = int(os.getenv("GEMINI_READ_TIMEOUT_SECONDS", "600"))
     if not 30 <= read_timeout <= 900:
         raise ValueError("GEMINI_READ_TIMEOUT_SECONDS must be 30..900")
-    if os.getenv("OPENAI_API_KEY", "").strip():
+    if backup_available:
         read_timeout = min(read_timeout, 90)
     LOG.info("Analysis request: model=%s parts=%d payload_bytes=%d timeout_seconds=%d",
              model, len(parts), len(json.dumps(parts).encode()), read_timeout)
@@ -495,9 +495,12 @@ def analyze_backup(parts, previous, api_key):
 def analyze_with_backup(state, parts, previous, model, key):
     backup_key = os.getenv("OPENAI_API_KEY", "").strip()
     resume = float(state.get("gemini_resume") or 0)
+    backup_resume = float(state.get("openai_resume") or 0)
+    if backup_key and time.time() < min(resume, backup_resume):
+        raise AnalysisRateLimit(min(resume, backup_resume) - time.time(), 503)
     if not backup_key or time.time() >= resume:
         try:
-            return analyze(parts, previous, model, key)
+            return analyze(parts, previous, model, key, backup_available=bool(backup_key and time.time() >= backup_resume))
         except AnalysisRateLimit as exc:
             if not backup_key:
                 raise
@@ -506,6 +509,8 @@ def analyze_with_backup(state, parts, previous, model, key):
             if not backup_key:
                 raise
             state.set("gemini_resume", time.time() + 60)
+    if time.time() < backup_resume:
+        raise AnalysisRateLimit(min(float(state.get("gemini_resume") or 0), backup_resume) - time.time(), 503)
     try:
         return analyze_backup(parts, previous, backup_key)
     except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
@@ -513,7 +518,17 @@ def analyze_with_backup(state, parts, previous, model, key):
         response = getattr(exc, "response", None)
         wait = response.headers.get("Retry-After") if response is not None else None
         status = 429 if response is not None and response.status_code == 429 else 503
-        raise AnalysisRateLimit(wait, status) from None
+        provider_error = AnalysisRateLimit(wait, status)
+        if status == 429:
+            delay = max(provider_error.delay, 900)
+            try:
+                if response.json().get("error", {}).get("code") in {"credit_balance_exhausted", "insufficient_quota"}:
+                    delay = max(delay, 3600)
+            except (ValueError, AttributeError):
+                pass
+            state.set("openai_resume", time.time() + delay)
+        gemini_wait = max(0, float(state.get("gemini_resume") or 0) - time.time())
+        raise AnalysisRateLimit(int(gemini_wait), 503) from None
 
 
 def validate_analysis(a, previous):
