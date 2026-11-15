@@ -58,6 +58,10 @@ class Retryable(Exception):
     pass
 
 
+class NeedsModel(Exception):
+    pass
+
+
 class ProviderCoolingDown(Exception):
     pass
 
@@ -128,6 +132,7 @@ class State:
           facts TEXT NOT NULL, decision TEXT NOT NULL, summary TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS company_history ON company_reports(issuer,id);
         CREATE TABLE IF NOT EXISTS timing(id TEXT PRIMARY KEY, received REAL, ready REAL, delivered REAL);
+        CREATE TABLE IF NOT EXISTS needs_model(id TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS review(id TEXT PRIMARY KEY, decision TEXT, elapsed REAL, expected TEXT, analysis TEXT);
 
         CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY,v TEXT);
@@ -647,9 +652,13 @@ def verified_adjustment(title, parts, previous, report_date):
                 impact="לא ניתן לקבוע", confidence="גבוהה", missing="השפעה על השליטה או על רווחי החברה לא נקבעה בדיווח.", facts=[])
 
 
-def evaluate(state, rid, url, model, key, historical=False):
+DOCUMENT_LOCK = threading.Lock()
+
+
+def evaluate(state, rid, url, model, key, historical=False, documents_only=False):
     context = {}
-    docs, parts = collect_documents(url, context)
+    with DOCUMENT_LOCK:
+        docs, parts = collect_documents(url, context)
     issuer = context.get("issuer", "")
     previous, facts = company_context(state, issuer, rid) if issuer else ({}, [])
     # Include alerts generated before issuer IDs were recorded.
@@ -666,6 +675,8 @@ def evaluate(state, rid, url, model, key, historical=False):
         exact = verified_adjustment(context["title"], parts, previous, received[0] if received else "")
         if exact:
             return exact, docs, issuer
+    if documents_only:
+        raise NeedsModel()
     if time.time() < float(state.get("analysis_resume") or 0):
         raise ProviderCoolingDown()
     if facts:
@@ -734,11 +745,14 @@ def replay_one(state, model, key):
     LOG.info("Silent historical review report=%s decision=%s", rid, decision)
 
 
-def process(state, model, key):
+def process(state, model, key, documents_only=False):
     cooldown = float(state.get("analysis_resume") or 0)
-    jobs = state.db.execute("SELECT id,subject,date,url,analysis,attempts,notice FROM jobs WHERE status='pending' AND due<=? ORDER BY rowid", (time.time(),)).fetchall()
-    if time.time() < cooldown:
-        jobs = [row for row in jobs if row[4] or "התאמת החזקות" in (row[1] or "")]
+    jobs = state.db.execute(
+        "SELECT id,subject,date,url,analysis,attempts,notice FROM jobs WHERE status='pending' AND due<=? "
+        "AND (instr(coalesce(subject,''),'התאמת החזקות')>0 AND id NOT IN (SELECT id FROM needs_model))=? "
+        "ORDER BY rowid", (time.time(), int(documents_only))).fetchall()
+    if not documents_only and time.time() < cooldown:
+        jobs = [row for row in jobs if row[4]]
     if not jobs:
         return
     # Reserve one in five dispatches for FIFO when both queues have work.
@@ -748,7 +762,7 @@ def process(state, model, key):
             return 0
         return 1 if URGENT.search(subject) or STATUS_CHANGE.search(subject) else 2
 
-    if len(jobs) > 1:
+    if not documents_only and len(jobs) > 1:
         turn = int(state.get("priority_turn") or 0)
         if turn % 5 != 4:
             jobs.sort(key=priority)
@@ -763,7 +777,7 @@ def process(state, model, key):
                 a, docs = saved["analysis"], saved["docs"]
                 issuer = saved.get("issuer", "")
             else:
-                a, docs, issuer = evaluate(state, rid, url, model, key)
+                a, docs, issuer = evaluate(state, rid, url, model, key, documents_only=True) if documents_only else evaluate(state, rid, url, model, key)
                 stage = "analysis"
                 if a["decision"] == "unknown":
                     raise Retryable("model could not verify content")
@@ -780,9 +794,13 @@ def process(state, model, key):
                     state.db.execute("INSERT OR REPLACE INTO sent VALUES (?,?)", (rid, json.dumps(a, ensure_ascii=False)))
                 state.db.execute("UPDATE jobs SET status='done' WHERE id=?", (rid,))
             LOG.info("Report %s completed decision=%s", rid, a["decision"])
-            if cooldown and time.time() >= cooldown and not cached:
+            if not documents_only and cooldown and time.time() >= cooldown and not cached:
                 with state.db:
                     state.db.execute("DELETE FROM meta WHERE k IN ('analysis_resume','analysis_backoff','recovery_jobs')")
+        except NeedsModel:
+            with state.db:
+                state.db.execute("INSERT OR IGNORE INTO needs_model VALUES (?)", (rid,))
+            return
         except ProviderCoolingDown:
             with state.db:
                 state.db.execute("UPDATE jobs SET due=? WHERE id=?", (cooldown, rid))
@@ -979,6 +997,7 @@ def main():
         LOG.info("Recent report %s status=%s decision=%s delivery=%s", rid, status, decision, delivery)
     state.db.close()
     loops = [("mail", 30, scan, ()),
+             ("holdings", 2, process, (None, None, True)),
              ("analysis", 2, process, (os.environ["GEMINI_MODEL"], os.environ["GEMINI_API_KEY"])),
              ("delivery", 5, deliver, (os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"]))]
     workers = [threading.Thread(target=run_loop, args=(os.environ["STATE_DB"], *loop),
@@ -993,4 +1012,5 @@ def main():
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     main()
+
 
