@@ -58,6 +58,10 @@ class Retryable(Exception):
     pass
 
 
+class ProviderCoolingDown(Exception):
+    pass
+
+
 class AnalysisFailure(Retryable):
     pass
 
@@ -409,6 +413,8 @@ def analyze(parts, previous, model, key):
     read_timeout = int(os.getenv("GEMINI_READ_TIMEOUT_SECONDS", "600"))
     if not 30 <= read_timeout <= 900:
         raise ValueError("GEMINI_READ_TIMEOUT_SECONDS must be 30..900")
+    if os.getenv("OPENAI_API_KEY", "").strip():
+        read_timeout = min(read_timeout, 90)
     LOG.info("Analysis request: model=%s parts=%d payload_bytes=%d timeout_seconds=%d",
              model, len(parts), len(json.dumps(parts).encode()), read_timeout)
     started = time.monotonic()
@@ -567,6 +573,65 @@ def company_context(state, issuer, rid):
     return history, facts
 
 
+def verified_adjustment(title, parts, previous, report_date):
+    """Handle the exchange's one-page adjustment form when every holder row is explained."""
+    if not title.startswith("התאמת החזקות") or len(parts) != 2 or "inlineData" not in parts[1]:
+        return None
+    from io import BytesIO
+    from pypdf import PdfReader
+    try:
+        pdf = PdfReader(BytesIO(base64.b64decode(parts[1]["inlineData"]["data"])))
+        if len(pdf.pages) != 1:
+            return None
+        body = pdf.pages[0].extract_text() or ""
+    except Exception:
+        return None
+    issuer = re.search(r"הנדון:.*?בעלי עניין\s*[-–]\s*([^\n(]+)", body)
+    if not issuer or "יחידת קשר עם החברות" not in body or "יתרת סגירה" not in body:
+        return None
+    firms = "הראל|הפניקס|מגדל|מנורה מבטחים|כלל ביטוח"
+    notes = " ".join(body.split())
+    counts = {}
+    for line in body.splitlines():
+        if " מניה " not in line:
+            continue
+        row = re.search(r"^\s*("+firms+r")\s*-.*?מניה\s+[\d,]+\s+[-\d,]+\s+([\d,]+)\s+(\d{1,2}\.\d{1,2}\.\d{2,4})", line)
+        if not row:
+            return None
+        firm, amount, date = row.groups()
+        counts[firm, date] = counts.get((firm, date), 0) + int(amount.replace(",", ""))
+    events = []
+    for (firm, date), count in counts.items():
+        entered = re.search(firm+r"\s+(?:החלה|הפכה) להיות בעלת עניין בחברה", notes)
+        exited = re.search(r"החזקות "+firm+r" ירדו אל מתחת ל[-־ ]?5\s*%", notes)
+        if bool(entered) == bool(exited):
+            return None
+        change = "החלה להיות בעלת עניין" if entered else "ירדה מתחת ל־5% וחדלה להיות בעלת עניין"
+        events.append(f"{firm} {change}. היתרה המדווחת ליום {date} היא {count:,} מניות.")
+    if not events:
+        return None
+    summary = " ".join(events)
+    for prior, value in previous.items():
+        # Per-issuer history stores summaries; legacy history stores JSON objects.
+        if isinstance(value, str) and value.startswith("{"):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                return None
+        if isinstance(value, dict):
+            if value.get("company") != issuer[1].strip():
+                continue
+            value = value.get("summary", "")
+        if value == summary:
+            return dict.fromkeys(FIELDS, "") | {"decision":"duplicate","duplicate_of":prior,"summary":summary,"facts":[]}
+        if any(firm in value for firm, _ in counts):
+            return None
+    return dict(decision="material", duplicate_of="", company=issuer[1].strip(), title=title,
+                reported_at=report_date, summary=summary,
+                importance="הרכב בעלי העניין המדווחים השתנה, ולכן האירוע עומד בכלל המעקב שלך אחר קבוצות ביטוח. מועד העדכון במאיה עשוי להיות מאוחר ממועד ההחזקה. מההתאמה לבדה אי אפשר להסיק שנעשתה עסקה במועד הפרסום.",
+                impact="לא ניתן לקבוע", confidence="גבוהה", missing="השפעה על השליטה או על רווחי החברה לא נקבעה בדיווח.", facts=[])
+
+
 def evaluate(state, rid, url, model, key, historical=False):
     context = {}
     docs, parts = collect_documents(url, context)
@@ -581,6 +646,13 @@ def evaluate(state, rid, url, model, key, historical=False):
         sent = state.db.execute("SELECT analysis FROM sent WHERE id=?", (related_id,)).fetchone()
         if sent:
             previous[related_id] = sent[0]
+    if context.get("title", "").startswith("התאמת החזקות"):
+        received = state.db.execute("SELECT date FROM jobs WHERE id=?", (rid,)).fetchone()
+        exact = verified_adjustment(context["title"], parts, previous, received[0] if received else "")
+        if exact:
+            return exact, docs, issuer
+    if time.time() < float(state.get("analysis_resume") or 0):
+        raise ProviderCoolingDown()
     if facts:
         parts.insert(0, {"text": "רקע היסטורי בלבד – נתוני החברה מדיווחים קודמים: " + json.dumps(facts, ensure_ascii=False)})
     official_title = context.get("title", "")
@@ -649,15 +721,15 @@ def replay_one(state, model, key):
 
 def process(state, model, key):
     cooldown = float(state.get("analysis_resume") or 0)
-    if time.time() < cooldown:
-        return
     jobs = state.db.execute("SELECT id,subject,date,url,analysis,attempts,notice FROM jobs WHERE status='pending' AND due<=? ORDER BY rowid", (time.time(),)).fetchall()
+    if time.time() < cooldown:
+        jobs = [row for row in jobs if row[4] or "התאמת החזקות" in (row[1] or "")]
     if not jobs:
         return
     # Reserve one in five dispatches for FIFO when both queues have work.
     def priority(row):
         subject = row[1] or ""
-        if insurance_transition(subject) or (INSURER.search(subject) and "החזקות" in subject):
+        if insurance_transition(subject) or "התאמת החזקות" in subject:
             return 0
         return 1 if URGENT.search(subject) or STATUS_CHANGE.search(subject) else 2
 
@@ -693,9 +765,13 @@ def process(state, model, key):
                     state.db.execute("INSERT OR REPLACE INTO sent VALUES (?,?)", (rid, json.dumps(a, ensure_ascii=False)))
                 state.db.execute("UPDATE jobs SET status='done' WHERE id=?", (rid,))
             LOG.info("Report %s completed decision=%s", rid, a["decision"])
-            if cooldown and not cached:
+            if cooldown and time.time() >= cooldown and not cached:
                 with state.db:
                     state.db.execute("DELETE FROM meta WHERE k IN ('analysis_resume','analysis_backoff','recovery_jobs')")
+        except ProviderCoolingDown:
+            with state.db:
+                state.db.execute("UPDATE jobs SET due=? WHERE id=?", (cooldown, rid))
+            return
         except AnalysisRateLimit as exc:
             pause_analysis(state, exc)
             return
