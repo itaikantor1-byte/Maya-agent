@@ -501,11 +501,64 @@ def analyze_backup(parts, previous, api_key, *, openrouter=False):
     return checked_result(json.loads(answer), parts, previous)
 
 
+def analyze_groq(parts, previous, api_key):
+    # Only complete text documents are eligible. Never drop a PDF or a footnote.
+    documents = [p["text"] for p in parts]
+    messages = [{"role": "system", "content": SYSTEM},
+                {"role": "user", "content": json.dumps({"documents": documents,
+                    "previous": previous}, ensure_ascii=False)}]
+    response = requests.post("https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": "Bearer " + api_key}, timeout=(10, 60),
+        json={"model": "qwen/qwen3.8-27b", "messages": messages,
+              "response_format": {"type": "json_object"}, "max_completion_tokens": 2500})
+    LOG.info("Groq analysis HTTP %d", response.status_code)
+    response.raise_for_status()
+    choice = response.json()["choices"][0]
+    if choice.get("finish_reason") != "stop":
+        raise ValueError("incomplete Groq response")
+    return checked_result(json.loads(choice["message"]["content"]), parts, previous)
+
+
+def check_groq_examples(api_key):
+    examples = [("חברת ביטוח א׳ חדלה להיות בעלת עניין. החזקתה ירדה מ־5.2% ל־4.8%.", "material"),
+                ("חברת ביטוח א׳ עדכנה החזקה מ־6.11% ל־6.12%. מעמדה כבעלת עניין נותר בעינו. אין שינוי נוסף.", "not_material")]
+    for description, expected in examples:
+        try:
+            result = analyze_groq([{"text": "דיווח מדומה של חברה א׳ לצורך בדיקה: " + description}], {}, api_key)
+            LOG.info("Groq Hebrew check expected=%s actual=%s", expected, result["decision"])
+        except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
+            LOG.warning("Groq Hebrew check unavailable: %s", type(exc).__name__)
+            break
+
+
 def analyze_with_backup(state, parts, previous, model, key):
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    groq_ready = bool(groq_key and all("text" in p for p in parts)
+                      and time.time() >= float(state.get("groq_resume") or 0))
+    try:
+        return analyze_with_router(state, parts, previous, model, key, groq_ready)
+    except (Retryable, requests.RequestException):
+        if not groq_ready:
+            raise
+    try:
+        result = analyze_groq(parts, previous, groq_key)
+    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
+        response = getattr(exc, "response", None)
+        status = response.status_code if response is not None else 503
+        wait = response.headers.get("Retry-After") if response is not None else None
+        failure = AnalysisRateLimit(wait, status)
+        if status in (401, 403, 429) or status >= 500:
+            state.set("groq_resume", time.time() + max(60, failure.delay))
+        raise failure from None
+    LOG.info("Groq analysis validated")
+    return result
+
+
+def analyze_with_router(state, parts, previous, model, key, groq_ready):
     router_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     router_ready = bool(router_key and time.time() >= float(state.get("openrouter_resume") or 0))
     try:
-        return analyze_primary_routes(state, parts, previous, model, key, router_ready)
+        return analyze_primary_routes(state, parts, previous, model, key, router_ready or groq_ready)
     except (AnalysisRateLimit, Retryable, requests.RequestException):
         if not router_ready:
             raise
@@ -995,6 +1048,11 @@ def main():
     state = State(os.environ["STATE_DB"])
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: STOP.set())
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    LOG.info("Groq backup configured=%s", bool(groq_key))
+    if groq_key and not state.get("groq_examples_v1"):
+        state.set("groq_examples_v1", "1")
+        threading.Thread(target=check_groq_examples, args=(groq_key,), daemon=True).start()
     backup_configured = bool(os.getenv("OPENAI_API_KEY", "").strip())
     LOG.info("OpenRouter free backup configured=%s", bool(os.getenv("OPENROUTER_API_KEY", "").strip()))
     LOG.info("OpenAI backup configured=%s", backup_configured)
