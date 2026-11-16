@@ -462,7 +462,7 @@ def checked_result(a, parts, previous):
     return a
 
 
-def analyze_backup(parts, previous, api_key):
+def analyze_backup(parts, previous, api_key, *, openrouter=False):
     content = [{"type": "input_text", "text": "Return a JSON object as instructed. התראות קודמות להשוואה בלבד: " + json.dumps(previous, ensure_ascii=False)}]
     for i, part in enumerate(parts):
         if "text" in part:
@@ -473,13 +473,17 @@ def analyze_backup(parts, previous, api_key):
                 raise ValueError("unsupported document")
             content.append({"type": "input_file", "filename": f"report-{i}.pdf",
                             "file_data": "data:application/pdf;base64," + pdf["data"]})
-    model = "gpt-5.4-mini"
-    response = requests.post("https://api.openai.com/v1/responses",
-        headers={"Authorization": "Bearer " + api_key}, timeout=(10, 180),
-        json={"model": model, "store": False, "instructions": SYSTEM,
-              "input": [{"role": "user", "content": content}],
-              "text": {"format": {"type": "json_object"}}, "max_output_tokens": 4500})
-    LOG.info("Backup analysis HTTP %d", response.status_code)
+    payload = {"model": "gpt-5.4-mini", "store": False, "instructions": SYSTEM,
+               "input": [{"role": "user", "content": content}],
+               "text": {"format": {"type": "json_object"}}, "max_output_tokens": 4500}
+    url = "https://api.openai.com/v1/responses"
+    if openrouter:
+        url = "https://openrouter.ai/api/v1/responses"
+        payload["model"] = "openrouter/free"
+        payload["plugins"] = [{"id": "file-parser", "pdf": {"engine": "cloudflare-ai"}}]
+    response = requests.post(url, headers={"Authorization": "Bearer " + api_key},
+                             timeout=(10, 180), json=payload)
+    LOG.info("%s analysis HTTP %d", "OpenRouter" if openrouter else "Backup", response.status_code)
     if not response.ok:
         try:
             error = response.json().get("error") or {}
@@ -498,22 +502,45 @@ def analyze_backup(parts, previous, api_key):
 
 
 def analyze_with_backup(state, parts, previous, model, key):
+    router_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    router_ready = bool(router_key and time.time() >= float(state.get("openrouter_resume") or 0))
+    try:
+        return analyze_primary_routes(state, parts, previous, model, key, router_ready)
+    except (AnalysisRateLimit, Retryable, requests.RequestException):
+        if not router_ready:
+            raise
+    try:
+        result = analyze_backup(parts, previous, router_key, openrouter=True)
+    except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+        response = getattr(exc, "response", None)
+        wait = response.headers.get("Retry-After") if response is not None else None
+        status = response.status_code if response is not None else 503
+        failure = AnalysisRateLimit(wait, status)
+        state.set("openrouter_resume", time.time() + max(60, failure.delay))
+        raise failure from None
+    LOG.info("OpenRouter analysis validated")
+    return result
+
+
+def analyze_primary_routes(state, parts, previous, model, key, router_ready):
     backup_key = os.getenv("OPENAI_API_KEY", "").strip()
     resume = float(state.get("gemini_resume") or 0)
     backup_resume = float(state.get("openai_resume") or 0)
     if backup_key and time.time() < min(resume, backup_resume):
         raise AnalysisRateLimit(min(resume, backup_resume) - time.time(), 503)
-    if not backup_key or time.time() >= resume:
+    if time.time() >= resume or not (backup_key or router_ready):
         try:
-            return analyze(parts, previous, model, key, backup_available=bool(backup_key and time.time() >= backup_resume))
+            return analyze(parts, previous, model, key, backup_available=bool(router_ready or (backup_key and time.time() >= backup_resume)))
         except AnalysisRateLimit as exc:
-            if not backup_key:
+            if not (backup_key or router_ready):
                 raise
             state.set("gemini_resume", time.time() + max(exc.delay, 900 if exc.status == 429 else 60))
         except (requests.Timeout, requests.ConnectionError):
-            if not backup_key:
+            if not (backup_key or router_ready):
                 raise
             state.set("gemini_resume", time.time() + 60)
+    if not backup_key:
+        raise AnalysisRateLimit(max(0, float(state.get("gemini_resume") or 0) - time.time()), 503)
     if time.time() < backup_resume:
         raise AnalysisRateLimit(min(float(state.get("gemini_resume") or 0), backup_resume) - time.time(), 503)
     try:
@@ -969,6 +996,7 @@ def main():
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: STOP.set())
     backup_configured = bool(os.getenv("OPENAI_API_KEY", "").strip())
+    LOG.info("OpenRouter free backup configured=%s", bool(os.getenv("OPENROUTER_API_KEY", "").strip()))
     LOG.info("OpenAI backup configured=%s", backup_configured)
     if backup_configured and state.get("backup_enabled") != "1":
         with state.db:
