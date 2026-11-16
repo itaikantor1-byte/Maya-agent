@@ -507,16 +507,25 @@ def analyze_groq(parts, previous, api_key):
     messages = [{"role": "system", "content": SYSTEM},
                 {"role": "user", "content": json.dumps({"documents": documents,
                     "previous": previous}, ensure_ascii=False)}]
-    response = requests.post("https://api.groq.com/openai/v1/chat/completions",
-        headers={"Authorization": "Bearer " + api_key}, timeout=(10, 60),
-        json={"model": "qwen/qwen3.8-27b", "messages": messages,
-              "response_format": {"type": "json_object"}, "max_completion_tokens": 2500})
-    LOG.info("Groq analysis HTTP %d", response.status_code)
-    response.raise_for_status()
-    choice = response.json()["choices"][0]
-    if choice.get("finish_reason") != "stop":
-        raise ValueError("incomplete Groq response")
-    return checked_result(json.loads(choice["message"]["content"]), parts, previous)
+    template = dict.fromkeys(FIELDS, "")
+    template["facts"] = []
+    messages[0]["content"] += "\nבכל סיווג החזר את כל השדות בתבנית הבאה. פרט ל-facts, השתמש רק במחרוזות. לשדה חסר השתמש במחרוזת ריקה ולא ב-null.\n" + json.dumps(template)
+    for attempt in range(2):
+        response = requests.post("https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": "Bearer " + api_key}, timeout=(10, 60),
+            json={"model": "qwen/qwen3.8-27b", "messages": messages, "temperature": 0,
+                  "response_format": {"type": "json_object"}, "max_completion_tokens": 2500})
+        LOG.info("Groq analysis HTTP %d", response.status_code)
+        response.raise_for_status()
+        choice = response.json()["choices"][0]
+        try:
+            if choice.get("finish_reason") != "stop":
+                raise ValueError("incomplete Groq response")
+            return checked_result(json.loads(choice["message"]["content"]), parts, previous)
+        except (ValueError, TypeError, KeyError):
+            if attempt:
+                raise
+            messages.append({"role": "user", "content": "התשובה הקודמת לא עמדה בתבנית. נתח מחדש את המסמך והחזר אובייקט JSON מלא בכל השדות, ללא שדות נוספים."})
 
 
 def check_groq_examples(api_key):
@@ -1050,8 +1059,8 @@ def main():
         signal.signal(sig, lambda *_: STOP.set())
     groq_key = os.getenv("GROQ_API_KEY", "").strip()
     LOG.info("Groq backup configured=%s", bool(groq_key))
-    if groq_key and not state.get("groq_examples_v1"):
-        state.set("groq_examples_v1", "1")
+    if groq_key and not state.get("groq_examples_v2"):
+        state.set("groq_examples_v2", "1")
         threading.Thread(target=check_groq_examples, args=(groq_key,), daemon=True).start()
     backup_configured = bool(os.getenv("OPENAI_API_KEY", "").strip())
     LOG.info("OpenRouter free backup configured=%s", bool(os.getenv("OPENROUTER_API_KEY", "").strip()))
