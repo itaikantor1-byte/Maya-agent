@@ -543,9 +543,15 @@ def check_groq_examples(api_key):
 
 
 def analyze_with_backup(state, parts, previous, model, key):
+    # A size rejection is specific to this unchanged payload, not a rate limit.
+    # Keep all source content and try other providers; do not hammer Groq.
+    payload_key = "groq_size:" + hashlib.sha256(json.dumps(
+        [SYSTEM, parts, previous], ensure_ascii=False, sort_keys=True
+    ).encode("utf-8")).hexdigest()
+    size_resume = float(state.get(payload_key) or 0)
     groq_key = os.getenv("GROQ_API_KEY", "").strip()
     groq_ready = bool(groq_key and all("text" in p for p in parts)
-                      and time.time() >= float(state.get("groq_resume") or 0))
+                      and time.time() >= max(size_resume, float(state.get("groq_resume") or 0)))
     try:
         return analyze_with_router(state, parts, previous, model, key, groq_ready)
     except (Retryable, requests.RequestException):
@@ -558,6 +564,12 @@ def analyze_with_backup(state, parts, previous, model, key):
         status = response.status_code if response is not None else 503
         wait = response.headers.get("Retry-After") if response is not None else None
         failure = AnalysisRateLimit(wait, status)
+        if status == 413:
+            # Allow a later probe in case provider limits change, without
+            # blocking smaller documents or resetting any job's state.
+            state.set(payload_key, time.time() + max(3600, failure.delay))
+            failure.delay = max(3600, failure.delay)
+            LOG.warning("Groq oversized payload deferred for one hour; other providers remain eligible")
         if status in (401, 403, 429) or status >= 500:
             state.set("groq_resume", time.time() + max(60, failure.delay))
         raise failure from None
