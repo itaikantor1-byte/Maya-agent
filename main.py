@@ -766,8 +766,6 @@ def evaluate(state, rid, url, model, key, historical=False, documents_only=False
             return exact, docs, issuer
     if documents_only:
         raise NeedsModel()
-    if time.time() < float(state.get("analysis_resume") or 0):
-        raise ProviderCoolingDown()
     if facts:
         parts.insert(0, {"text": "רקע היסטורי בלבד – נתוני החברה מדיווחים קודמים: " + json.dumps(facts, ensure_ascii=False)})
     official_title = context.get("title", "")
@@ -835,13 +833,10 @@ def replay_one(state, model, key):
 
 
 def process(state, model, key, documents_only=False):
-    cooldown = float(state.get("analysis_resume") or 0)
     jobs = state.db.execute(
         "SELECT id,subject,date,url,analysis,attempts,notice FROM jobs WHERE status='pending' AND due<=? "
         "AND (instr(coalesce(subject,''),'התאמת החזקות')>0 AND id NOT IN (SELECT id FROM needs_model))=? "
         "ORDER BY rowid", (time.time(), int(documents_only))).fetchall()
-    if not documents_only and time.time() < cooldown:
-        jobs = [row for row in jobs if row[4]]
     if not jobs:
         return
     # Reserve one in five dispatches for FIFO when both queues have work.
@@ -883,19 +878,18 @@ def process(state, model, key, documents_only=False):
                     state.db.execute("INSERT OR REPLACE INTO sent VALUES (?,?)", (rid, json.dumps(a, ensure_ascii=False)))
                 state.db.execute("UPDATE jobs SET status='done' WHERE id=?", (rid,))
             LOG.info("Report %s completed decision=%s", rid, a["decision"])
-            if not documents_only and cooldown and time.time() >= cooldown and not cached:
-                with state.db:
-                    state.db.execute("DELETE FROM meta WHERE k IN ('analysis_resume','analysis_backoff','recovery_jobs')")
         except NeedsModel:
             with state.db:
                 state.db.execute("INSERT OR IGNORE INTO needs_model VALUES (?)", (rid,))
             return
-        except ProviderCoolingDown:
-            with state.db:
-                state.db.execute("UPDATE jobs SET due=? WHERE id=?", (cooldown, rid))
-            return
         except AnalysisRateLimit as exc:
-            pause_analysis(state, exc)
+            # Provider-specific timers are enforced by the routing functions.
+            # A PDF/provider failure must not block unrelated text-only reports.
+            delay = min(300, max(60, exc.delay))
+            with state.db:
+                state.db.execute("UPDATE jobs SET due=? WHERE id=?", (time.time() + delay, rid))
+            LOG.warning("Report %s waiting for analysis provider HTTP %d; retry in %.0f seconds",
+                        rid, exc.status, delay)
             return
         except Exception as exc:
             if isinstance(exc, AnalysisFailure):
