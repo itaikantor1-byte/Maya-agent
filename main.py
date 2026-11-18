@@ -836,10 +836,11 @@ def process(state, model, key, documents_only=False):
     jobs = state.db.execute(
         "SELECT id,subject,date,url,analysis,attempts,notice FROM jobs WHERE status='pending' AND due<=? "
         "AND (instr(coalesce(subject,''),'התאמת החזקות')>0 AND id NOT IN (SELECT id FROM needs_model))=? "
-        "ORDER BY rowid", (time.time(), int(documents_only))).fetchall()
+        "ORDER BY due, rowid", (time.time(), int(documents_only))).fetchall()
     if not jobs:
         return
-    # Reserve one in five dispatches for FIFO when both queues have work.
+    # Order by eligibility before age so retries cannot starve untouched reports.
+    # Reserve one in five dispatches for this fair order across priority classes.
     def priority(row):
         subject = row[1] or ""
         if insurance_transition(subject) or "התאמת החזקות" in subject:
