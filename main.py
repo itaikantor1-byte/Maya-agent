@@ -646,7 +646,7 @@ def analyze_primary_routes(state, parts, previous, model, key, router_ready):
 
 def excluded_notice(title):
     title = re.sub(r'[״“”]', '"', title or "")
-    bond = bool(re.search(r'אג["\x27]?ח|א[י]?גרות חוב|\bbonds?\b|\bdebentures?\b', title, re.I))
+    bond = bool(re.search(r'אג["\x27׳]{0,2}ח|א[י]?גרות חוב|\bbonds?\b|\bdebentures?\b', title, re.I))
     # Bond fundraising must reach source-based economic analysis, including results.
     fundraising = bool(re.search(r'הנפק|גיוס|הרחבת סדר|issuance|offering|raising', title, re.I))
     if bond and fundraising:
@@ -657,8 +657,9 @@ def excluded_notice(title):
             return True
     return bool(re.search(
         r"(?:מועד|תאריך)\s+(?:פרסום|פרסומם|פרסומו).*?(?:דוח|דוחו|דו״ח|דו\"ח)|"
-        r"(?:תוצאות|השלמת|סיום)\s+(?:הנפק|גיוס הון|ההנפק)|"
-        r"(?:pricing|results|closing|completion)\s+of\s+(?:the\s+|an?\s+)?(?:offering|issuance|capital raising)|"
+        # Generic offering results may be material bond fundraising: read the source.
+        r"(?:תוצאות|השלמת|סיום)\s+(?:(?:הנפקת|ההנפקה של)\s+מניות|גיוס הון)|"
+        r"(?:pricing|results|closing|completion)\s+of\s+(?:the\s+|an?\s+)?(?:equity|share|stock)\s+(?:offering|issuance)|"
         r"(?:earnings|financial results).*?(?:release date|release schedule)|"
         r"(?:date|schedule).*?(?:earnings|financial results)",
         title, re.I))
