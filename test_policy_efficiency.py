@@ -3,6 +3,12 @@ from unittest.mock import patch
 import main
 
 class PolicyEfficiencyTests(unittest.TestCase):
+    def test_ambiguous_offering_results_reach_source_analysis(self):
+        for title in ['פז אנרגיה-תוצאות הנפקה', 'השלמת ההנפקה', 'Results of offering', 'Closing of the issuance', "תוצאות הנפקת אג''ח", 'תוצאות הנפקת אג׳׳ח']:
+            self.assertFalse(main.excluded_notice(title), title)
+        for title in ['תוצאות הנפקת מניות', 'תוצאות גיוס הון', 'Results of equity offering', 'מועד פרסום דוחות']:
+            self.assertTrue(main.excluded_notice(title), title)
+
     def test_bond_results_require_economic_analysis(self):
         for title in ['חברה - תוצאות הנפקת אג״ח', 'הרחבת סדרת אגרות חוב', 'Results of bond offering']:
             self.assertFalse(main.excluded_notice(title), title)
