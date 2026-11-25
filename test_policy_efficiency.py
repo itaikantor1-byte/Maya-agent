@@ -37,7 +37,7 @@ class PolicyEfficiencyTests(unittest.TestCase):
     def test_source_documents_unchanged(self):
         s=main.State(':memory:')
         parts=[{'text':'מקור מלא '*20000}]
-        with patch.object(main,'analyze_with_router',return_value={'decision':'not_material'}) as analyze:
+        with patch.object(main,'route_analysis',return_value={'decision':'not_material'}) as analyze:
             main.analyze_with_backup(s,parts,{},'model','key')
         self.assertIs(analyze.call_args.args[1],parts)
         self.assertEqual(len(parts[0]['text']),len('מקור מלא '*20000))
