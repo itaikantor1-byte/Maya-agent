@@ -19,10 +19,11 @@ class QueueTests(unittest.TestCase):
         self.network.stop()
         self.state.db.close()
 
-    def test_delta_only_officer_update(self):
+    def test_all_companies_officer_updates(self):
         self.assertTrue(main.excluded_notice('דלתא-שינוי החזקות נושאי משרה'))
-        self.assertTrue(main.excluded_notice('דלתא גליל - החזקות בעלי עניין ונושאי משרה'))
-        for s in ['בזק-שינוי אחזקות נושאי משרה', 'דלתא-דוח רבעוני ועדכון אחזקות נושאי משרה',
+        for title in ['בזק-שינוי אחזקות נושאי משרה', 'מינוי נושא משרה', 'סיום כהונת מנכ״ל', 'Appointment of CEO', 'Director remuneration']:
+            self.assertTrue(main.excluded_notice(title), title)
+        for s in ['דלתא גליל - החזקות בעלי עניין ונושאי משרה', 'דלתא-דוח רבעוני ועדכון אחזקות נושאי משרה',
                   'דלתא-שינוי החזקות נושאי משרה; הפכה לבעלת עניין-הראל', 'דלתא-עסקה מהותית']:
             self.assertFalse(main.excluded_notice(s), s)
 
