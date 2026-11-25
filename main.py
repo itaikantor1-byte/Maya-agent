@@ -649,7 +649,7 @@ def route_analysis(state, parts, previous, model, key):
             raise
         except (Retryable, requests.RequestException, ValueError, KeyError, TypeError, IndexError) as exc:
             response = getattr(exc, "response", None)
-            status = getattr(exc, "status", response.status_code if response is not None else 503)
+            status = getattr(exc, "status", response.status_code if response is not None else None)
             retry_after = getattr(exc, "delay", 0)
             code = ""
             if response is not None:
@@ -676,7 +676,11 @@ def route_analysis(state, parts, previous, model, key):
             else:
                 state.set(provider + "_resume", now + delay)
                 state.set(provider + "_backoff", int(delay))
-            LOG.warning("Provider %s deferred HTTP=%s delay=%.0fs; next route on later dispatch", provider, status, delay)
+            actual_wait = max(float(state.get(provider + "_resume") or 0),
+                              float(state.get(provider + ":payload:" + fingerprint) or 0)) - now
+            category = "http" if status is not None else ("transport" if isinstance(exc, requests.RequestException) else "validation_or_extraction")
+            LOG.warning("Provider %s deferred category=%s HTTP=%s exception=%s delay=%.0fs; next route on later dispatch",
+                        provider, category, status if status is not None else "none", type(exc).__name__, max(0, actual_wait))
             raise WorkDeferred(5) from None
         state.set(provider + "_backoff", 30)
         LOG.info("Analysis validated provider=%s", provider)
