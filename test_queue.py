@@ -56,6 +56,17 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(result['decision'],'not_material')
             self.assertEqual(primary.call_count,1)
 
+    def test_validation_failure_not_reported_as_http_503(self):
+        with patch.dict(os.environ, {'GROQ_API_KEY':'fake'}), patch.object(main,'chunked_groq',side_effect=ValueError('sensitive input must not be logged')):
+            with self.assertLogs(main.LOG, level='WARNING') as logs:
+                with self.assertRaises(main.WorkDeferred):
+                    main.route_analysis(self.state,[{'text':'test'}],{},'model','')
+        message=' '.join(logs.output)
+        self.assertIn('category=validation_or_extraction',message)
+        self.assertIn('HTTP=none',message)
+        self.assertIn('delay=3600s',message)
+        self.assertNotIn('sensitive input',message)
+
     def test_exhausted_credit_long_cooldown(self):
         self.state.set('gemini_resume', main.time.time()+1000)
         response=Mock(status_code=429, headers={})
