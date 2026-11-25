@@ -13,7 +13,7 @@ class MonitorTests(unittest.TestCase):
             with patch.object(main.requests, 'post', return_value=Mock(status_code=503)) as send:
                 with self.assertRaises(main.Retryable):
                     main.analyze(parts, {}, 'test-model', 'AQ.fake-key')
-                self.assertEqual(send.call_args.kwargs['timeout'], (10, 600))
+                self.assertEqual(send.call_args.kwargs['timeout'], (10, 45))
                 self.assertEqual(send.call_args.kwargs['json']['contents'][0]['parts'][1:], parts)
 
     def test_invalid_timeout_rejected_before_request(self):
@@ -90,3 +90,4 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(s.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0],1)
 
 if __name__=='__main__': unittest.main()
+
