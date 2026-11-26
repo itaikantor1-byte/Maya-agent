@@ -19,6 +19,15 @@ class QueueTests(unittest.TestCase):
         self.network.stop()
         self.state.db.close()
 
+    def test_safe_failure_reason_codes(self):
+        for message, reason in [("schema", "schema"), ("PDF requires visual analysis", "pdf_requires_vision"),
+                                ("material analysis must be in Hebrew", "non_hebrew"),
+                                ("incomplete backup response", "incomplete_response")]:
+            self.assertEqual(main.analysis_failure_reason(ValueError(message)), reason)
+        self.assertEqual(main.analysis_failure_reason(ValueError("secret-model-response")), "unspecified")
+        self.assertEqual(main.analysis_failure_reason(KeyError("secret-key")), "response_shape")
+        self.assertEqual(main.analysis_failure_reason(json.JSONDecodeError("bad", "secret", 0)), "invalid_json")
+
     def test_all_companies_officer_updates(self):
         self.assertTrue(main.excluded_notice('דלתא-שינוי החזקות נושאי משרה'))
         for title in ['בזק-שינוי אחזקות נושאי משרה', 'מינוי נושא משרה', 'סיום כהונת מנכ״ל', 'Appointment of CEO', 'Director remuneration']:
