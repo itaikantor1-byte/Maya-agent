@@ -428,6 +428,30 @@ def normalize_gemini_key(key):
     return key
 
 
+def analysis_failure_reason(exc):
+    """Only emit fixed application codes; never log model output or secrets."""
+    reasons = {
+        "schema": "schema", "decision": "decision",
+        "unrecognized duplicate": "unrecognized_duplicate",
+        "empty material result": "empty_material_result",
+        "material analysis must be in Hebrew": "non_hebrew",
+        "oversized result": "oversized_result",
+        "invalid result": "invalid_result",
+        "incomplete response": "incomplete_response",
+        "incomplete backup response": "incomplete_response",
+        "unsupported document": "unsupported_document",
+        "PDF requires visual analysis": "pdf_requires_vision",
+        "incomplete chunk extraction": "incomplete_chunk",
+        "chunk reduction did not converge": "reduction_not_converged",
+        "incomplete synthesis": "incomplete_synthesis",
+    }
+    if isinstance(exc, json.JSONDecodeError):
+        return "invalid_json"
+    if isinstance(exc, (KeyError, IndexError, TypeError)):
+        return "response_shape"
+    return reasons.get(str(exc), "unspecified")
+
+
 def analyze(parts, previous, model, key, *, backup_available=None):
     key = normalize_gemini_key(key)
     read_timeout = int(os.getenv("GEMINI_READ_TIMEOUT_SECONDS", "45"))
@@ -460,7 +484,8 @@ def analyze(parts, previous, model, key, *, backup_available=None):
             raise ValueError("incomplete response")
         a = json.loads("".join(p.get("text", "") for p in candidate["content"]["parts"] if not p.get("thought")))
         return checked_result(a, parts, previous)
-    except (KeyError, IndexError, TypeError, ValueError):
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        LOG.warning("Gemini result rejected reason=%s", analysis_failure_reason(exc))
         raise Retryable("invalid analysis result") from None
 
 
@@ -679,8 +704,8 @@ def route_analysis(state, parts, previous, model, key):
             actual_wait = max(float(state.get(provider + "_resume") or 0),
                               float(state.get(provider + ":payload:" + fingerprint) or 0)) - now
             category = "http" if status is not None else ("transport" if isinstance(exc, requests.RequestException) else "validation_or_extraction")
-            LOG.warning("Provider %s deferred category=%s HTTP=%s exception=%s delay=%.0fs; next route on later dispatch",
-                        provider, category, status if status is not None else "none", type(exc).__name__, max(0, actual_wait))
+            LOG.warning("Provider %s deferred category=%s HTTP=%s exception=%s reason=%s delay=%.0fs; next route on later dispatch",
+                        provider, category, status if status is not None else "none", type(exc).__name__, analysis_failure_reason(exc), max(0, actual_wait))
             raise WorkDeferred(5) from None
         state.set(provider + "_backoff", 30)
         LOG.info("Analysis validated provider=%s", provider)
